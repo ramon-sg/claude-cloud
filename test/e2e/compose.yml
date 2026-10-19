@@ -1,0 +1,12 @@
+# Test bench: a proxy that blocks GitHub and a root container that can only reach the net through it.
+name: claude-cloud-e2e
+services:
+  squid:
+    image: ubuntu/squid:latest
+    command: ["-NYC", "-f", "/etc/squid/squid.conf"]
+    volumes:
+      - ./squid.conf:/etc/squid/squid.conf:ro
+  box:
+    build: .
+    depends_on:
+      - squid

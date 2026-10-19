@@ -1,0 +1,6 @@
+{
+  "version": "0.0.0",
+  "apt": ["jq"],
+  "docker": { "pull": false },
+  "setup": ["echo built > setup-ran.txt"]
+}

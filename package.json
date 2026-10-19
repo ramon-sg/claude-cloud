@@ -4,6 +4,23 @@
   "description": "Zero-dependency CLI that prepares Claude Code cloud sessions.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ramon-sg/claude-cloud.git"
+  },
+  "homepage": "https://github.com/ramon-sg/claude-cloud#readme",
+  "bugs": {
+    "url": "https://github.com/ramon-sg/claude-cloud/issues"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "cloud",
+    "sandbox",
+    "setup",
+    "session-start",
+    "cli"
+  ],
   "bin": {
     "claude-cloud": "dist/cli.js"
   },
