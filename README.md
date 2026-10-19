@@ -33,7 +33,9 @@ In the environment form at `https://claude.ai/code`:
 
 1. **Network access:** choose *Custom* and keep **Also include default list of common package
    managers** checked. Add any extra domains your `apt` repos or setup steps need, one per line.
-   Run `npx @ramon-sg/claude-cloud doctor` in a session to see which hosts are blocked.
+   Run `claude-cloud doctor` in a session to see which hosts are blocked (it probes with `curl`,
+   so it goes through the proxy like the setup does). If the setup never ran, use
+   `npx @ramon-sg/claude-cloud doctor`.
 2. **Setup script:** the cloud runs it as root from `/home/user`, before Claude starts:
 
    ```bash
@@ -74,26 +76,31 @@ broken file never stops a session.
 | Field         | Required | Meaning                                                                                                                                              |
 | ------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `version`     | yes      | Exact version of this package to run (no ranges). If `setup` runs a different one it relaunches with this one.                                       |
-| `aptRepos`    | no       | `https://` URLs of apt repository setup scripts, downloaded and run before installing packages.                                                      |
+| `aptRepos`    | no       | HTTPS URLs of setup scripts that add APT repositories; each is downloaded and piped to `bash` before installing packages.                            |
 | `apt`         | no       | Debian packages to install. Names are validated and passed as arguments, never to a shell.                                                           |
 | `docker.pull` | no       | `"auto"` (default) pulls the images found in compose files and in `FROM` lines pinned with `@sha256`; a list of image names pulls those; `false` leaves Docker alone during `setup`. |
 | `setup`       | no       | Shell commands run once during `setup`, in the repo, with the pinned tools first on `PATH`. A failing command is recorded and the rest still run.    |
-| `session`     | no       | Shell commands run at the start of every session, in the repo. A failing command is reported and the rest still run.                                 |
+| `session`     | no       | Shell commands run at the start of every session, in the repo. Their output goes to stderr (not into Claude's context), each one is stopped after 2 minutes, and a failing command is reported while the rest still run. |
 | `requiredEnv` | no       | Environment variables that must be set; the session warns about the missing ones.                                                                    |
-| `notes`       | no       | Path (inside the repo) to a text file whose contents are shown at the start of every session.                                                        |
+| `notes`       | no       | Path, relative to the repo, of a text file appended to the session notes shown at the start of every session.                                       |
 
 Tool versions are deduced, in order, from `.tool-versions`, `mise.toml`, `.nvmrc` and
 `package.json#packageManager`. The default branch comes from `origin/HEAD`. Each tool is installed
 under `/opt/claude-cloud/<tool>-<version>`, so versions coexist and the repos of one environment
 share the folder. A tool with no installer produces a warning and is skipped.
 
+A Node version that is not exact (`22`, `22.1`, `lts/iron`, `lts/*` or `node`) is resolved during
+`setup` to the newest matching release in `https://nodejs.org/dist/index.json` and installed under
+`/opt/claude-cloud/node-<exact version>`. The resolved version is recorded in the machine state, so
+`session` puts the same folder on `PATH`.
+
 ## Commands
 
 | Command                       | What it does                                                                                                                                                                                                                       |
 | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `claude-cloud setup [--repo <path>]` | Runs as root before Claude starts. For every git repo in the home dir (`/home/user`) with a `.claude/cloud.json` (or only `<path>`): installs tools, apt packages and images, runs the `setup` steps, installs itself to `/opt/claude-cloud/bin/claude-cloud` and records the result. Repos without the file are skipped with a notice. It always exits 0: failures are recorded, never fatal. |
-| `claude-cloud session`        | Runs from the `SessionStart` hook, in seconds and without network (except to complete the clone). Warns when setup did not run, failed steps, or the machine was prepared with another configuration; writes the `PATH` line to `$CLAUDE_ENV_FILE`; starts Docker; fetches the full history and `origin/<default branch>`; runs the `session` steps. It never fails the session start. |
-| `claude-cloud docker`         | Starts `dockerd` detached and waits up to 60 seconds for it to answer. Exits 1 if it does not.                                                                                                                                      |
+| `claude-cloud setup [--repo <path>]` | Runs as root before Claude starts. For every git repo in the home dir (`/home/user`) with a `.claude/cloud.json` (or only `<path>`): installs tools, apt packages and images and copies itself (no npm, no network) to `/opt/claude-cloud/bin/claude-cloud`, then runs the `setup` steps and records the result. Repos without the file are skipped with a notice. It always exits 0: failures are recorded, never fatal. |
+| `claude-cloud session`        | Runs from the `SessionStart` hook, in seconds and without network (except to complete the clone). Warns when setup did not run, failed steps, or the machine was prepared with another configuration; writes the `PATH` line (the pinned tools, then `/opt/claude-cloud/bin`, so `claude-cloud` itself resolves) to `$CLAUDE_ENV_FILE`; starts Docker; fetches the full history and `origin/<default branch>`; runs the `session` steps. It never fails the session start. |
+| `claude-cloud docker`         | Starts `dockerd` detached and waits up to 60 seconds for it to answer. Exits 1 if it does not, at once when `dockerd` is not installed.                                                                                             |
 | `claude-cloud doctor`         | Checks that the proxy lets the needed hosts through, that the pinned tools are installed, that Docker answers, and the recorded state (fingerprint and each step). Exits 1 if any check fails.                                       |
 | `claude-cloud init`           | Creates `.claude/cloud.json` if missing and adds the `SessionStart` hook to `.claude/settings.json`, keeping the hooks already there. Safe to run again.                                                                           |
 
@@ -155,6 +162,24 @@ RUN --mount=type=secret,id=proxy_ca \
 - It does not run your `setup` steps on a resumed session; only a new session does.
 - `setup` runs code fetched from npm as root. The version is pinned in the repo and the relaunch
   uses exactly that version.
+
+## Releasing
+
+For maintainers. Releases are published by `.github/workflows/publish.yml` when a GitHub release is
+published; the workflow fails if the release tag, without its leading `v`, differs from the
+`version` in `package.json`.
+
+The first publish of a new package cannot use npm trusted publishing, because trusted publishing
+is configured on a package that already exists. Publish the first version by hand:
+
+1. Either run `npm ci && npm run build && npm publish --provenance=false` from a machine logged in
+   to npm (`npm login`) with publish rights on the `@ramon-sg` scope (provenance needs a CI, and
+   `package.json` asks for it), or run the workflow once with an `NPM_TOKEN` secret
+   (`NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}` on the publish step).
+2. On npmjs.com, open the package settings and add a trusted publisher: this GitHub repository and
+   the `publish.yml` workflow.
+3. Remove the `NPM_TOKEN` secret if you created one. From then on, bump `version` in
+   `package.json`, update `CHANGELOG.md`, and publish a GitHub release tagged `v<version>`.
 
 ## License
 

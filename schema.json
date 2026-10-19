@@ -16,7 +16,7 @@
       "type": "array",
       "items": { "type": "string" },
       "default": [],
-      "description": "APT source lines to add before installing packages."
+      "description": "HTTPS URLs of setup scripts that add APT repositories (piped to bash)."
     },
     "apt": {
       "type": "array",
@@ -58,6 +58,9 @@
       "default": [],
       "description": "Environment variables that must be set; a warning is shown when missing."
     },
-    "notes": { "type": "string", "description": "Free-form notes shown to the user." }
+    "notes": {
+      "type": "string",
+      "description": "Path, relative to the repo, of a text file appended to the session notes."
+    }
   }
 }

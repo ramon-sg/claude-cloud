@@ -15,6 +15,8 @@ All notable changes to this project are documented in this file. The format foll
 - `claude-cloud docker`, `claude-cloud doctor` and `claude-cloud init`.
 - Tool installers whose sources pass the cloud egress proxy: Node (nodejs.org), Bun, Deno, pnpm and
   Yarn (npm) and uv (PyPI), installed side by side under `/opt/claude-cloud`.
+- Non-exact Node versions (`22`, `22.1`, `lts/<name>`, `lts/*`, `node`) resolved through the
+  Node.js release index and recorded in the machine state.
 - Version detection from `.tool-versions`, `mise.toml`, `.nvmrc` and `package.json#packageManager`;
   Docker image detection from compose files and pinned `FROM` lines.
 - `.claude/cloud.json` configuration with a JSON schema (`schema.json`).
