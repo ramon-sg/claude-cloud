@@ -10,16 +10,17 @@ import { afterEach, beforeEach, test } from "node:test";
 import { fingerprint } from "../src/state.ts";
 import { writeState } from "../src/state.ts";
 import type { CloudConfig } from "../src/config.ts";
-import type { Run } from "../src/run.ts";
+import { RunTimeoutError } from "../src/run.ts";
+import type { Run, RunOptions } from "../src/run.ts";
 import type { StepResult } from "../src/steps.ts";
-import { session, toolsEnv } from "../src/session.ts";
+import { SESSION_STEP_TIMEOUT_MS, session, toolsEnv } from "../src/session.ts";
 
 const NOTE = "claude-cloud: you are in a Claude Code cloud session. There are no open ports or previews: test against localhost. gh pr and gh issue fail (the GitHub proxy blocks GraphQL): use gh api (REST).";
 
 let root: string;
 let repo: string;
 let tools: string;
-let calls: Array<{ cmd: string; args: string[]; cwd?: string; env?: NodeJS.ProcessEnv }>;
+let calls: Array<{ cmd: string; args: string[]; cwd?: string; env?: NodeJS.ProcessEnv; opts?: RunOptions }>;
 let dockerStarts: number;
 
 beforeEach(() => {
@@ -33,8 +34,9 @@ beforeEach(() => {
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
 const run: Run = async (cmd, args, opts) => {
-  calls.push({ cmd, args, cwd: opts?.cwd, env: opts?.env });
+  calls.push({ cmd, args, cwd: opts?.cwd, env: opts?.env, opts });
   if (cmd === "bash" && args[1]?.startsWith("fail")) throw new Error("exit 1");
+  if (cmd === "bash" && args[1]?.startsWith("hang")) throw new RunTimeoutError("bash", opts?.timeoutMs ?? 0);
 };
 
 const ctx = (env: NodeJS.ProcessEnv = {}) => ({
@@ -52,8 +54,8 @@ const config = (extra: Partial<CloudConfig> = {}): CloudConfig => ({
   version: "1.0.0", aptRepos: [], apt: [], docker: { pull: "auto" }, setup: [], session: [], requiredEnv: [], ...extra,
 });
 
-const record = (steps: StepResult[], fp = fingerprint(config(), {}, [], "1.0.0")) =>
-  writeState(tools, repo, { fingerprint: fp, packageVersion: "1.0.0", finishedAt: "now", steps });
+const record = (steps: StepResult[], fp = fingerprint(config(), {}, [], "1.0.0"), resolved = {}) =>
+  writeState(tools, repo, { fingerprint: fp, packageVersion: "1.0.0", finishedAt: "now", steps, resolved });
 
 test("repo without cloud.json prints only the generic note", async () => {
   assert.deepEqual(await session(repo, ctx()), [NOTE]);
@@ -137,7 +139,7 @@ test("with CLAUDE_ENV_FILE writes the PATH line and the quoted CA", async () => 
   const envFile = join(root, "env");
   await session(repo, ctx({ CLAUDE_ENV_FILE: envFile, SSL_CERT_FILE: ca }));
   const text = readFileSync(envFile, "utf8");
-  assert.ok(text.includes(`export PATH="${tools}/node-24.14.1/bin:$PATH"`));
+  assert.ok(text.includes(`export PATH="${tools}/node-24.14.1/bin:${tools}/bin:$PATH"`));
   assert.ok(text.includes(`export CLOUD_PROXY_CA='${root}/it'\\''s.crt'`));
 });
 
@@ -212,10 +214,51 @@ test("notes: symlinks escaping the repo are skipped and dot-prefixed names are a
   assert.ok((await session(repo, ctx())).includes("claude-cloud: dotted"));
 });
 
-test("toolsEnv prepends the pinned bin dirs and adds the CA", () => {
-  const env = toolsEnv({ node: "24.14.1" }, "/t", { PATH: "/usr/bin", X: "1" }, "/ca.crt");
+test("toolsEnv prepends the directories and adds the CA", () => {
+  const env = toolsEnv(["/t/node-24.14.1/bin"], { PATH: "/usr/bin", X: "1" }, "/ca.crt");
   assert.equal(env.PATH, "/t/node-24.14.1/bin:/usr/bin");
   assert.equal(env.CLOUD_PROXY_CA, "/ca.crt");
   assert.equal(env.X, "1");
-  assert.equal(toolsEnv({}, "/t", { PATH: "/usr/bin" }).PATH, "/usr/bin");
+  assert.equal(toolsEnv([], { PATH: "/usr/bin" }).PATH, "/usr/bin");
+});
+
+test("the PATH line puts claude-cloud's bin dir on PATH even with no pinned tools", async () => {
+  writeConfig({ session: ["echo hi"] });
+  const envFile = join(root, "env");
+  await session(repo, ctx({ CLAUDE_ENV_FILE: envFile, PATH: "/usr/bin" }));
+  assert.equal(readFileSync(envFile, "utf8"), `export PATH="${tools}/bin:$PATH"\n`);
+  assert.equal(calls.find((c) => c.cmd === "bash")?.env?.PATH, `${tools}/bin:/usr/bin`);
+});
+
+test("a partial node version maps to the exact version setup resolved", async () => {
+  writeConfig({ session: ["echo hi"] });
+  writeFileSync(join(repo, ".nvmrc"), "22\n");
+  record([], fingerprint(config(), { node: "22" }, [], "1.0.0"), { node: "22.12.0" });
+  const envFile = join(root, "env");
+  const lines = await session(repo, ctx({ CLAUDE_ENV_FILE: envFile }));
+  assert.ok(!lines.some((l) => l.includes("another configuration")), lines.join("\n"));
+  assert.ok(readFileSync(envFile, "utf8").includes(`export PATH="${tools}/node-22.12.0/bin:${tools}/bin:$PATH"`));
+});
+
+test("an env file that cannot be written is one line and the session goes on", async () => {
+  writeConfig({ session: ["echo hi"] });
+  const envFile = join(root, "a-directory");
+  mkdirSync(envFile);
+  const lines = await session(repo, ctx({ CLAUDE_ENV_FILE: envFile }));
+  assert.ok(lines.some((l) => l.startsWith(`claude-cloud: could not write CLAUDE_ENV_FILE (${envFile}):`)), lines.join("\n"));
+  assert.ok(!lines.some((l) => l.includes("session error")));
+  assert.ok(calls.some((c) => c.cmd === "bash" && c.args[1] === "echo hi"));
+});
+
+test("session steps send their output to stderr and have a time limit", async () => {
+  writeConfig({ session: ["hang forever", "echo next"] });
+  const lines = await session(repo, ctx());
+  const steps = calls.filter((c) => c.cmd === "bash");
+  for (const step of steps) {
+    assert.equal(step.opts?.stdio, "stderr");
+    assert.equal(step.opts?.timeoutMs, SESSION_STEP_TIMEOUT_MS);
+  }
+  assert.equal(SESSION_STEP_TIMEOUT_MS, 120_000);
+  assert.ok(lines.includes("claude-cloud: session step timed out: hang forever"));
+  assert.ok(steps.some((c) => c.args[1] === "echo next"));
 });

@@ -2,7 +2,8 @@
  * @file Tool installers whose download sources pass the Claude cloud egress proxy
  * (nodejs.org, npm and PyPI; GitHub releases are blocked).
  */
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TOOLS } from "./detect.ts";
 import type { Tool } from "./detect.ts";
@@ -11,7 +12,7 @@ import { step } from "./steps.ts";
 import type { StepResult } from "./steps.ts";
 
 /** Pinned versions by tool. */
-type Versions = Partial<Record<Tool, string>>;
+export type Versions = Partial<Record<Tool, string>>;
 
 /** Base URL of the Node.js distribution. */
 const NODE_DIST_URL = "https://nodejs.org/dist";
@@ -41,6 +42,30 @@ const NPM_PACKAGES: Readonly<Record<"bun" | "deno" | "pnpm", string>> = {
 
 /** Strict shape of an accepted version: no leading `-` or `/`, no shell metacharacters. */
 const VERSION_PATTERN = /^\d+(\.\d+){0,2}([-+][0-9A-Za-z.]+)?$/;
+
+/** An exact Node.js version (`x.y.z`, optionally with a suffix): installed as is, no lookup. */
+const NODE_EXACT = /^\d+\.\d+\.\d+([-+][0-9A-Za-z.]+)?$/;
+
+/** Node.js aliases resolved through the release index: `lts/<name>`, `lts/*` and `node`. */
+const NODE_ALIAS = /^(lts\/(\*|[A-Za-z]+)|node)$/;
+
+/** Alias for the newest Node.js release. */
+const NODE_LATEST = "node";
+
+/** Alias for the newest Node.js LTS release. */
+const NODE_LTS_ANY = "lts/*";
+
+/** Prefix of a named Node.js LTS alias. */
+const NODE_LTS_PREFIX = "lts/";
+
+/** Index of every Node.js release, newest first. */
+const NODE_INDEX_URL = `${NODE_DIST_URL}/index.json`;
+
+/** Time limit of the index download, in seconds. */
+const NODE_INDEX_TIMEOUT_SECONDS = "60";
+
+/** File name of the downloaded index inside its temp directory. */
+const NODE_INDEX_FILE = "index.json";
 
 /** Script that downloads (`$1`) and extracts into a directory (`$2`); fails if curl fails. */
 const NODE_INSTALL_SCRIPT = 'set -o pipefail; curl -fsSL -- "$1" | tar -xJ -C "$2" --strip-components=1';
@@ -119,6 +144,162 @@ function isValidVersion(version: string): boolean {
 }
 
 /**
+ * Tells whether a requested version is accepted for a tool: the strict pattern, plus the
+ * `lts/<name>`, `lts/*` and `node` aliases for node only. Aliases never become path segments.
+ *
+ * @param tool - Tool name.
+ * @param version - Version taken from an untrusted file.
+ * @returns True when it can be installed (possibly after resolving it).
+ * @example
+ * isValidRequest("node", "lts/iron"); // true
+ */
+export function isValidRequest(tool: Tool, version: string): boolean {
+  return isValidVersion(version) || (tool === "node" && NODE_ALIAS.test(version));
+}
+
+/** One entry of the Node.js release index. */
+export interface NodeRelease {
+  /** Version with a leading `v`, such as `v22.12.0`. */
+  version: string;
+  /** LTS codename, or false for a non-LTS release. */
+  lts: string | false;
+}
+
+/** Downloads the Node.js release index. */
+export type NodeIndexFetcher = () => Promise<NodeRelease[]>;
+
+/**
+ * Compares two exact `x.y.z` versions numerically.
+ *
+ * @param a - First version.
+ * @param b - Second version.
+ * @returns A positive number when `a` is newer, negative when older, 0 when equal.
+ */
+function compareVersions(a: string, b: string): number {
+  const pa = a.split(/[.+-]/).slice(0, 3).map(Number);
+  const pb = b.split(/[.+-]/).slice(0, 3).map(Number);
+  for (let i = 0; i < pa.length; i++) {
+    const diff = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (diff) return diff;
+  }
+  return 0;
+}
+
+/**
+ * Tells whether an exact version satisfies a requested node version.
+ *
+ * @param requested - Version as written in the repo (`22`, `22.1`, `lts/iron`, `node`...).
+ * @param exact - Exact version without `v`.
+ * @param lts - LTS codename of the exact version, when known; `undefined` skips the alias check.
+ * @returns True when it matches the numeric prefix, or the alias.
+ * @example
+ * nodeMatches("22.1", "22.1.5"); // true
+ */
+export function nodeMatches(requested: string, exact: string, lts?: string | false): boolean {
+  if (NODE_ALIAS.test(requested)) {
+    if (lts === undefined || requested === NODE_LATEST) return true;
+    if (requested === NODE_LTS_ANY) return lts !== false;
+    return lts !== false && lts.toLowerCase() === requested.slice(NODE_LTS_PREFIX.length).toLowerCase();
+  }
+  const want = requested.split(".");
+  const have = exact.split(".");
+  return want.every((part, i) => part === have[i]);
+}
+
+/**
+ * Picks the newest release of the index that satisfies a requested node version.
+ *
+ * @param requested - Non-exact version (`22`, `22.1`, `lts/iron`, `lts/*` or `node`).
+ * @param index - Release index.
+ * @returns The exact version without `v`, or undefined when nothing matches.
+ * @example
+ * resolveNodeVersion("lts/iron", [{ version: "v20.18.1", lts: "Iron" }]); // "20.18.1"
+ */
+export function resolveNodeVersion(requested: string, index: NodeRelease[]): string | undefined {
+  let best: string | undefined;
+  for (const release of index) {
+    const exact = release.version.replace(/^v/, "");
+    if (!NODE_EXACT.test(exact) || !nodeMatches(requested, exact, release.lts)) continue;
+    if (!best || compareVersions(exact, best) > 0) best = exact;
+  }
+  return best;
+}
+
+/**
+ * Builds a fetcher that downloads the Node.js release index with curl into a temp file. The URL
+ * and the file travel as argv, and curl honors the proxy environment.
+ *
+ * @param run - Process runner.
+ * @param env - Environment for curl.
+ * @returns The fetcher.
+ * @example
+ * const index = await curlNodeIndex(runProcess, process.env)();
+ */
+export function curlNodeIndex(run: Run, env: NodeJS.ProcessEnv): NodeIndexFetcher {
+  return async () => {
+    const dir = mkdtempSync(join(tmpdir(), "claude-cloud-node-index-"));
+    try {
+      const file = join(dir, NODE_INDEX_FILE);
+      await run("curl", ["-fsSL", "--max-time", NODE_INDEX_TIMEOUT_SECONDS, "-o", file, "--", NODE_INDEX_URL], { env });
+      const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
+      if (!Array.isArray(parsed)) throw new Error("the node release index is not a list");
+      return parsed.filter(
+        (r): r is NodeRelease =>
+          typeof r === "object" && r !== null && typeof r.version === "string" && (r.lts === false || typeof r.lts === "string"),
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+}
+
+/**
+ * Turns the requested versions into installable ones: a non-exact node version is resolved to an
+ * exact one through the release index; every other tool is kept as requested.
+ *
+ * @param versions - Requested versions by tool.
+ * @param fetchIndex - Downloads the release index; called only when node needs resolving.
+ * @returns The installable versions (node left out when it cannot be resolved) and one failed
+ *   result when the resolution failed.
+ * @example
+ * await resolveVersions({ node: "22" }, curlNodeIndex(runProcess, process.env)); // { resolved: { node: "22.12.0" }, results: [] }
+ */
+export async function resolveVersions(
+  versions: Versions,
+  fetchIndex: NodeIndexFetcher,
+): Promise<{ resolved: Versions; results: StepResult[] }> {
+  const resolved: Versions = { ...versions };
+  const requested = versions.node;
+  if (!requested || NODE_EXACT.test(requested) || !isValidRequest("node", requested)) return { resolved, results: [] };
+  delete resolved.node;
+  let exact: string | undefined;
+  const result = await step(`node ${requested}`, async () => {
+    exact = resolveNodeVersion(requested, await fetchIndex());
+    if (!exact) throw new Error(`no node release matches ${requested}`);
+  });
+  if (!exact) return { resolved, results: [result] };
+  resolved.node = exact;
+  return { resolved, results: [] };
+}
+
+/**
+ * Finds the version whose directory holds a tool: the requested one, or for a non-exact node
+ * version the exact one setup resolved it to.
+ *
+ * @param tool - Tool name.
+ * @param requested - Version as written in the repo.
+ * @param resolved - Versions setup installed (from the machine state).
+ * @returns The version used in the install path, or undefined when there is none.
+ */
+function installedVersion(tool: Tool, requested: string, resolved: Versions): string | undefined {
+  if (tool !== "node") return isValidVersion(requested) ? requested : undefined;
+  if (NODE_EXACT.test(requested)) return requested;
+  const exact = resolved.node;
+  if (!exact || !NODE_EXACT.test(exact) || !isValidRequest("node", requested)) return undefined;
+  return nodeMatches(requested, exact) ? exact : undefined;
+}
+
+/**
  * Builds the default directory layout for a tool.
  *
  * @param tool - Tool name.
@@ -190,9 +371,10 @@ function prependPath(dir: string, path: string | undefined): string {
 }
 
 /**
- * Installs the pinned tools: node first, then the rest in series.
+ * Installs the pinned tools: node first, then the rest in series. A non-exact node version must
+ * be resolved first (`resolveVersions`).
  *
- * @param versions - Pinned versions by tool.
+ * @param versions - Installable versions by tool.
  * @param toolsDir - Root directory holding all tools.
  * @param run - Process runner.
  * @param env - Environment for child processes.
@@ -215,6 +397,12 @@ export async function installTools(
       results.push(await step(`${tool} ${version}`, async () => assertVersion(tool, version)));
       continue;
     }
+    if (tool === "node" && !NODE_EXACT.test(version)) {
+      results.push(await step(`${tool} ${version}`, async () => {
+        throw new Error(`node ${version} must be resolved to an exact version first`);
+      }));
+      continue;
+    }
     const installer = INSTALLERS[tool];
     const binDir = installer.binDir(toolsDir, version);
     if (!existsSync(join(binDir, EXECUTABLES[tool]))) {
@@ -226,31 +414,48 @@ export async function installTools(
 }
 
 /**
- * Lists the bin directories of the pinned tools, in `TOOLS` order; invalid versions are skipped.
+ * Lists the bin directories of the pinned tools, in `TOOLS` order. A non-exact node version maps
+ * to the exact version setup resolved it to; invalid or unresolved versions are skipped.
  *
- * @param versions - Pinned versions by tool.
+ * @param versions - Requested versions by tool.
  * @param toolsDir - Root directory holding all tools.
+ * @param resolved - Versions setup installed (`MachineState.resolved`); empty when unknown.
  * @returns The bin directories to put on PATH.
  * @example
- * toolBinDirs({ node: "24.14.1" }, "/opt/claude-cloud"); // ["/opt/claude-cloud/node-24.14.1/bin"]
+ * toolBinDirs({ node: "22" }, "/opt/claude-cloud", { node: "22.12.0" }); // ["/opt/claude-cloud/node-22.12.0/bin"]
  */
-export function toolBinDirs(versions: Versions, toolsDir: string): string[] {
+export function toolBinDirs(versions: Versions, toolsDir: string, resolved: Versions = {}): string[] {
   return TOOLS.flatMap((tool) => {
-    const version = versions[tool];
-    return version && isValidVersion(version) ? [INSTALLERS[tool].binDir(toolsDir, version)] : [];
+    const requested = versions[tool];
+    const version = requested ? installedVersion(tool, requested, resolved) : undefined;
+    return version ? [INSTALLERS[tool].binDir(toolsDir, version)] : [];
   });
 }
 
 /**
- * Builds the shell line that puts the pinned tools on PATH.
+ * Finds the bin directory that holds a pinned tool's executable.
  *
- * @param versions - Pinned versions by tool.
+ * @param tool - Tool name.
+ * @param requested - Version as written in the repo.
  * @param toolsDir - Root directory holding all tools.
- * @returns An `export PATH=...` line with a literal `$PATH`, or an empty string when nothing valid is pinned; invalid versions are skipped.
+ * @param resolved - Versions setup installed (`MachineState.resolved`).
+ * @returns The executable path, or undefined when the version is invalid or not resolved.
  * @example
- * pathLine({ node: "24.14.1" }, "/opt/claude-cloud"); // export PATH="/opt/claude-cloud/node-24.14.1/bin:$PATH"
+ * toolExecutable("node", "24.14.1", "/opt/claude-cloud", {}); // "/opt/claude-cloud/node-24.14.1/bin/node"
  */
-export function pathLine(versions: Versions, toolsDir: string): string {
-  const dirs = toolBinDirs(versions, toolsDir);
+export function toolExecutable(tool: Tool, requested: string, toolsDir: string, resolved: Versions): string | undefined {
+  const version = installedVersion(tool, requested, resolved);
+  return version ? join(INSTALLERS[tool].binDir(toolsDir, version), EXECUTABLES[tool]) : undefined;
+}
+
+/**
+ * Builds the shell line that puts directories first on PATH.
+ *
+ * @param dirs - Directories, in order.
+ * @returns An `export PATH=...` line with a literal `$PATH`, or an empty string when there are none.
+ * @example
+ * pathLine(["/opt/claude-cloud/node-24.14.1/bin"]); // export PATH="/opt/claude-cloud/node-24.14.1/bin:$PATH"
+ */
+export function pathLine(dirs: string[]): string {
   return dirs.length ? `export PATH="${dirs.join(":")}:$PATH"` : "";
 }

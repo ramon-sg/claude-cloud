@@ -75,6 +75,7 @@ test("writeState then readState round-trips and leaves no temp files", () => {
     packageVersion: "1.0.0",
     finishedAt: "2026-01-01T00:00:00Z",
     steps: [{ name: "a", ok: true, ms: 1 }],
+    resolved: { node: "22.12.0" },
   };
   writeState(dir, "/x/repo", state);
   assert.deepEqual(readState(dir, "/x/repo"), state);
@@ -87,4 +88,21 @@ test("readState returns undefined for invalid JSON or missing fields", () => {
   assert.equal(readState(dir, "/x/repo"), undefined);
   writeFileSync(statePath(dir, "/x/repo"), JSON.stringify({ fingerprint: "a" }));
   assert.equal(readState(dir, "/x/repo"), undefined);
+});
+
+test("readState rejects steps of the wrong shape", () => {
+  mkdirSync(join(dir, "state"));
+  const base = { fingerprint: "a", packageVersion: "1.0.0", finishedAt: "now" };
+  for (const steps of [[{ name: "a", ok: true }], [{ name: "a", ok: true, ms: "1" }], [{ name: 1, ok: true, ms: 1 }], [null], [{ name: "a", ok: "yes", ms: 1 }]]) {
+    writeFileSync(statePath(dir, "/x/repo"), JSON.stringify({ ...base, steps }));
+    assert.equal(readState(dir, "/x/repo"), undefined, JSON.stringify(steps));
+  }
+  writeFileSync(statePath(dir, "/x/repo"), JSON.stringify({ ...base, steps: [], resolved: { node: 22 } }));
+  assert.equal(readState(dir, "/x/repo"), undefined);
+});
+
+test("readState fills a missing resolved map", () => {
+  mkdirSync(join(dir, "state"));
+  writeFileSync(statePath(dir, "/x/repo"), JSON.stringify({ fingerprint: "a", packageVersion: "1.0.0", finishedAt: "now", steps: [] }));
+  assert.deepEqual(readState(dir, "/x/repo")?.resolved, {});
 });

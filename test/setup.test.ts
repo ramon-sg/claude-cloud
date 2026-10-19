@@ -2,7 +2,7 @@
  * @file Tests for the setup phase of one repo.
  */
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
@@ -11,6 +11,7 @@ import type { Run } from "../src/run.ts";
 import { session } from "../src/session.ts";
 import { setupRepo } from "../src/setup.ts";
 import { readState } from "../src/state.ts";
+import { FAKE_CLI, fakePackage } from "./fake-package.ts";
 
 /** Milliseconds each fake command takes, so lanes really overlap in time. */
 const FAKE_MS = 5;
@@ -52,8 +53,18 @@ function exclusive(cmd: string, args: string[]): string | undefined {
   return undefined;
 }
 
+/** Fake Node.js release index served to curl. */
+const INDEX = [
+  { version: "v24.14.1", lts: "Krypton" },
+  { version: "v22.12.0", lts: "Jod" },
+  { version: "v22.11.0", lts: "Jod" },
+];
+
 /** Fake runner that records each call, takes some time and flags overlapping exclusive work. */
 const run: Run = async (cmd, args) => {
+  if (cmd === "curl" && args.includes("https://nodejs.org/dist/index.json")) {
+    writeFileSync(args[args.indexOf("-o") + 1] ?? "", JSON.stringify(INDEX));
+  }
   const label = `${cmd} ${args.join(" ")}`;
   log.push(label);
   const group = exclusive(cmd, args);
@@ -79,7 +90,17 @@ const docker = (up = true): DockerOps => ({
   },
 });
 
-const ctx = (up = true) => ({ toolsDir: tools, run, packageVersion: "1.0.0", env: {}, docker: docker(up) });
+const ctx = (up = true) => ({
+  toolsDir: tools,
+  run,
+  packageVersion: "1.0.0",
+  env: {},
+  docker: docker(up),
+  packageRoot: fakePackage(root, "1.0.0"),
+});
+
+/** Where the self install puts the package. */
+const installed = (): string => join(tools, "pkg", "1.0.0", "node_modules", "@ramon-sg", "claude-cloud");
 
 const writeConfig = (extra: Record<string, unknown> = {}) =>
   writeFileSync(join(repo, ".claude/cloud.json"), JSON.stringify({ version: "1.0.0", ...extra }));
@@ -103,30 +124,44 @@ test("apt work runs in order and never overlaps, even with tools and docker in p
   assert.deepEqual(overlaps, []);
 });
 
-test("setup steps run after the tools, with the tools on PATH, and self install comes last", async () => {
+test("setup steps run after the tools and the self install, with both on PATH", async () => {
   writeFileSync(join(repo, ".tool-versions"), "nodejs 24.14.1\n");
   writeConfig({ setup: ["echo one", "echo two"] });
   const envs: Array<NodeJS.ProcessEnv | undefined> = [];
+  let linkedBeforeSteps = false;
   const recording: Run = async (cmd, args, opts) => {
-    if (cmd === "bash" && args[0] === "-c" && args[1]?.startsWith("echo")) envs.push(opts?.env);
+    if (cmd === "bash" && args[0] === "-c" && args[1]?.startsWith("echo")) {
+      envs.push(opts?.env);
+      linkedBeforeSteps ||= existsSync(join(tools, "bin", "claude-cloud"));
+    }
     await run(cmd, args, opts);
   };
-  const state = await setupRepo(repo, { ...ctx(), run: recording });
+  const state = await setupRepo(repo, { ...ctx(), env: { PATH: "/usr/bin" }, run: recording });
   const nodeAt = log.findIndex((l) => l.includes("nodejs.org"));
   const oneAt = log.indexOf("bash -c echo one");
   const twoAt = log.indexOf("bash -c echo two");
   assert.ok(nodeAt >= 0 && nodeAt < oneAt && oneAt < twoAt);
-  assert.match(envs[0]?.PATH ?? "", new RegExp(`^${join(tools, "node-24.14.1", "bin")}`));
-  assert.equal(
-    log.at(-1),
-    `npm install --prefix ${join(tools, "pkg", "1.0.0")} --no-save --no-audit --no-fund @ramon-sg/claude-cloud@1.0.0`,
-  );
-  assert.equal(
-    readlinkSync(join(tools, "bin", "claude-cloud")),
-    join(tools, "pkg", "1.0.0", "node_modules", ".bin", "claude-cloud"),
-  );
-  assert.deepEqual(state.steps.map((s) => s.name), ["node 24.14.1", "setup: echo one", "setup: echo two", "self install 1.0.0"]);
+  assert.ok(linkedBeforeSteps);
+  assert.equal(envs[0]?.PATH, `${join(tools, "node-24.14.1", "bin")}:${join(tools, "bin")}:/usr/bin`);
+  assert.deepEqual(state.steps.map((s) => s.name), ["node 24.14.1", "self install 1.0.0", "setup: echo one", "setup: echo two"]);
+  assert.deepEqual(state.resolved, { node: "24.14.1" });
   assert.deepEqual(readState(tools, repo), state);
+});
+
+test("self install copies the running package without npm and links its binary", async () => {
+  writeConfig();
+  const state = await setupRepo(repo, ctx());
+  assert.equal(state.steps.find((s) => s.name === "self install 1.0.0")?.ok, true, JSON.stringify(state.steps));
+  assert.ok(!log.some((l) => l.startsWith("npm")));
+  assert.equal(JSON.parse(readFileSync(join(installed(), "package.json"), "utf8")).version, "1.0.0");
+  const cli = join(installed(), "dist", "cli.js");
+  assert.equal(readFileSync(cli, "utf8"), FAKE_CLI);
+  assert.ok(existsSync(join(installed(), "dist", "setup.js")));
+  assert.equal(statSync(cli).mode & 0o777, 0o755);
+  const bin = join(tools, "pkg", "1.0.0", "node_modules", ".bin", "claude-cloud");
+  assert.equal(readlinkSync(bin), join("..", "@ramon-sg", "claude-cloud", "dist", "cli.js"));
+  assert.equal(readlinkSync(join(tools, "bin", "claude-cloud")), bin);
+  assert.equal(realpathSync(join(tools, "bin", "claude-cloud")), realpathSync(cli));
 });
 
 test("a failing step does not stop the others", async () => {
@@ -136,7 +171,7 @@ test("a failing step does not stop the others", async () => {
   assert.equal(byName["apt-get install"], false);
   assert.equal(byName["setup: fail now"], false);
   assert.equal(byName["setup: echo after"], true);
-  assert.equal(byName["self install 1.0.0"], true);
+  assert.equal(byName["self install 1.0.0"], true, JSON.stringify(state.steps));
 });
 
 test("untrusted apt names, repo urls and images fail without being run", async () => {
@@ -169,16 +204,47 @@ test("docker that does not start is one failed step and no pulls", async () => {
   assert.equal(dockerStep?.error, "dockerd did not start; see /var/log/claude-cloud-dockerd.log");
 });
 
-test("self install skips npm when the binary is already there and replaces the symlink", async () => {
+test("self install skips the copy when that version is already there and replaces the link", async () => {
   writeConfig();
-  const bin = join(tools, "pkg", "1.0.0", "node_modules", ".bin");
-  mkdirSync(bin, { recursive: true });
-  writeFileSync(join(bin, "claude-cloud"), "");
+  mkdirSync(join(installed(), "dist"), { recursive: true });
+  writeFileSync(join(installed(), "package.json"), JSON.stringify({ version: "1.0.0" }));
+  writeFileSync(join(installed(), "dist", "cli.js"), "already here");
   mkdirSync(join(tools, "bin"), { recursive: true });
   symlinkSync("/old/target", join(tools, "bin", "claude-cloud"));
   await setupRepo(repo, ctx());
-  assert.ok(!log.some((l) => l.startsWith("npm install")));
-  assert.equal(readlinkSync(join(tools, "bin", "claude-cloud")), join(bin, "claude-cloud"));
+  assert.equal(readFileSync(join(installed(), "dist", "cli.js"), "utf8"), "already here");
+  assert.equal(readlinkSync(join(tools, "bin", "claude-cloud")), join(tools, "pkg", "1.0.0", "node_modules", ".bin", "claude-cloud"));
+});
+
+test("self install replaces another version's leftovers and refuses a source of another version", async () => {
+  writeConfig();
+  mkdirSync(installed(), { recursive: true });
+  writeFileSync(join(installed(), "package.json"), JSON.stringify({ version: "0.9.0" }));
+  await setupRepo(repo, ctx());
+  assert.equal(JSON.parse(readFileSync(join(installed(), "package.json"), "utf8")).version, "1.0.0");
+  rmSync(join(tools, "pkg"), { recursive: true });
+  const state = await setupRepo(repo, { ...ctx(), packageRoot: fakePackage(root, "2.0.0") });
+  const self = state.steps.find((s) => s.name === "self install 1.0.0");
+  assert.equal(self?.ok, false);
+  assert.match(self?.error ?? "", /is 2\.0\.0, not 1\.0\.0/);
+});
+
+test("a partial node version is resolved, installed by its exact version and recorded", async () => {
+  writeFileSync(join(repo, ".nvmrc"), "22\n");
+  writeConfig({ setup: ["echo one"] });
+  const envs: Array<NodeJS.ProcessEnv | undefined> = [];
+  const recording: Run = async (cmd, args, opts) => {
+    if (cmd === "bash" && args[1] === "echo one") envs.push(opts?.env);
+    await run(cmd, args, opts);
+  };
+  const state = await setupRepo(repo, { ...ctx(), run: recording });
+  assert.ok(log.some((l) => l.includes("node-v22.12.0-linux")));
+  assert.deepEqual(state.resolved, { node: "22.12.0" });
+  assert.ok(envs[0]?.PATH?.startsWith(join(tools, "node-22.12.0", "bin")));
+  const envFile = join(root, "env");
+  const lines = await session(repo, { env: { CLAUDE_ENV_FILE: envFile }, toolsDir: tools, run, packageVersion: "1.0.0", docker: docker() });
+  assert.ok(!lines.some((l) => l.includes("another configuration")), lines.join("\n"));
+  assert.ok(readFileSync(envFile, "utf8").includes(join(tools, "node-22.12.0", "bin")));
 });
 
 test("a repo without a valid config resolves with a failed step and writes no state", async () => {

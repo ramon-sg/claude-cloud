@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import type { CloudConfig } from "./config.ts";
+import { TOOLS } from "./detect.ts";
 import type { Tool } from "./detect.ts";
 import type { StepResult } from "./steps.ts";
 
@@ -30,6 +31,8 @@ export interface MachineState {
   finishedAt: string;
   /** Outcome of every step. */
   steps: StepResult[];
+  /** Versions setup installed, by tool; a non-exact node request maps to the exact version. */
+  resolved: Partial<Record<Tool, string>>;
 }
 
 /**
@@ -104,19 +107,58 @@ export function writeState(toolsDir: string, repo: string, state: MachineState):
 }
 
 /**
- * Tells whether a parsed value has the shape of a `MachineState`.
+ * Tells whether a value is a plain JSON object.
+ *
+ * @param value - Any parsed JSON value.
+ * @returns True for non-null, non-array objects.
+ */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Tells whether a parsed value has the shape of a `StepResult`.
+ *
+ * @param value - Any parsed JSON value.
+ * @returns True for a string `name`, a boolean `ok`, a finite numeric `ms` and an optional string `error`.
+ */
+function isStepResult(value: unknown): value is StepResult {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.name === "string" &&
+    typeof value.ok === "boolean" &&
+    typeof value.ms === "number" &&
+    Number.isFinite(value.ms) &&
+    (value.error === undefined || typeof value.error === "string")
+  );
+}
+
+/**
+ * Tells whether a parsed value is a map of known tools to version strings.
+ *
+ * @param value - Any parsed JSON value.
+ * @returns True when every key is a tool and every value a string.
+ */
+function isVersionMap(value: unknown): value is Partial<Record<Tool, string>> {
+  if (!isRecord(value)) return false;
+  return Object.entries(value).every(([k, v]) => (TOOLS as readonly string[]).includes(k) && typeof v === "string");
+}
+
+/**
+ * Tells whether a parsed value has the shape of a `MachineState`; a missing `resolved` is accepted.
  *
  * @param value - Any parsed JSON value.
  * @returns True when all required fields are present with the right types.
  */
-function isMachineState(value: unknown): value is MachineState {
-  if (typeof value !== "object" || value === null) return false;
-  const v = value as Record<string, unknown>;
+function isMachineState(value: unknown): value is Omit<MachineState, "resolved"> & { resolved?: MachineState["resolved"] } {
+  if (!isRecord(value)) return false;
   return (
-    typeof v.fingerprint === "string" &&
-    typeof v.packageVersion === "string" &&
-    typeof v.finishedAt === "string" &&
-    Array.isArray(v.steps)
+    typeof value.fingerprint === "string" &&
+    typeof value.packageVersion === "string" &&
+    typeof value.finishedAt === "string" &&
+    Array.isArray(value.steps) &&
+    value.steps.every(isStepResult) &&
+    (value.resolved === undefined || isVersionMap(value.resolved))
   );
 }
 
@@ -132,7 +174,7 @@ function isMachineState(value: unknown): value is MachineState {
 export function readState(toolsDir: string, repo: string): MachineState | undefined {
   try {
     const parsed: unknown = JSON.parse(readFileSync(statePath(toolsDir, repo), "utf8"));
-    return isMachineState(parsed) ? parsed : undefined;
+    return isMachineState(parsed) ? { ...parsed, resolved: parsed.resolved ?? {} } : undefined;
   } catch {
     return undefined;
   }

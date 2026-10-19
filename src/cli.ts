@@ -15,8 +15,8 @@ import type { DockerOps } from "./docker.ts";
 import { init } from "./init.ts";
 import { findRepos, packageBin, planSetup, relaunch } from "./launcher.ts";
 import type { SetupPlanItem } from "./launcher.ts";
-import { runProcess } from "./run.ts";
-import type { Run } from "./run.ts";
+import { captureProcess, runProcess } from "./run.ts";
+import type { Capture, Run } from "./run.ts";
 import { session } from "./session.ts";
 import { setupRepo } from "./setup.ts";
 
@@ -70,12 +70,14 @@ export interface CliDeps {
   packageVersion: string;
   /** Prints one line on stdout. */
   print: (line: string) => void;
-  /** Fetch used by `doctor`; the global one when omitted. */
-  fetch?: typeof fetch;
+  /** Output capture used by `doctor` to run curl; the real one when omitted. */
+  capture?: Capture;
   /** Docker probe used by `doctor`; `docker info` when omitted. */
   dockerInfo?: () => boolean;
   /** Working directory, used to find the repo when `CLAUDE_PROJECT_DIR` is not set. */
   cwd: string;
+  /** Root of the package that setup copies into the tools dir; the running package when omitted. */
+  packageRoot?: string;
 }
 
 /**
@@ -118,6 +120,7 @@ async function runOne(repo: string, deps: CliDeps): Promise<void> {
     packageVersion: deps.packageVersion,
     env: deps.env,
     docker: deps.docker,
+    packageRoot: deps.packageRoot,
   });
   const failed = state.steps.filter((s) => !s.ok).map((s) => s.name);
   const detail = failed.length ? ` (${failed.join(", ")})` : "";
@@ -246,7 +249,7 @@ async function dockerCommand(deps: CliDeps): Promise<number> {
  */
 async function doctorCommand(deps: CliDeps): Promise<number> {
   const result = await doctor(sessionRepo(deps), {
-    fetch: deps.fetch ?? fetch,
+    capture: deps.capture ?? captureProcess,
     toolsDir: toolsDir(deps.env),
     packageVersion: deps.packageVersion,
     dockerInfo: deps.dockerInfo ?? dockerResponds,

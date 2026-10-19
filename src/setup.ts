@@ -1,22 +1,24 @@
 /**
  * @file The `setup` phase for one repo: runs as root before Claude starts, installs the pinned
- * tools, apt packages and Docker images, runs the repo's setup steps, installs this package into
- * the tools dir and records the result. Values from the repo config are untrusted: they are
+ * tools, apt packages and Docker images and copies this package into the tools dir, then runs the
+ * repo's setup steps and records the result. Values from the repo config are untrusted: they are
  * validated and always passed as argv, never interpolated into a shell string.
  */
-import { existsSync, mkdirSync, renameSync, rmSync, symlinkSync } from "node:fs";
-import { dirname } from "node:path";
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync } from "node:fs";
+import { dirname, join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
 import { findProxyCa } from "./ca.ts";
 import { readConfig } from "./config.ts";
 import type { CloudConfig } from "./config.ts";
-import { DOCKERD_LOG, PACKAGE, PULL_JOBS } from "./constants.ts";
+import { DOCKERD_LOG, PULL_JOBS } from "./constants.ts";
 import { configImages, readToolVersions } from "./detect.ts";
 import { realDocker } from "./docker.ts";
 import type { DockerOps } from "./docker.ts";
-import { installTools } from "./installers.ts";
-import { linkPath, packageBin, packageDir } from "./launcher.ts";
+import { curlNodeIndex, installTools, resolveVersions } from "./installers.ts";
+import type { Versions } from "./installers.ts";
+import { linkPath, packageBin, packageInstallDir } from "./launcher.ts";
 import type { Run } from "./run.ts";
-import { toolsEnv } from "./session.ts";
+import { pathDirs, toolsEnv } from "./session.ts";
 import { fingerprint, writeState } from "./state.ts";
 import type { MachineState } from "./state.ts";
 import { lanes, step } from "./steps.ts";
@@ -43,6 +45,21 @@ const WHITESPACE = /\s/;
 /** Prefix of the name of each repo setup step. */
 const SETUP_STEP_PREFIX = "setup: ";
 
+/** Manifest file of this package. */
+const MANIFEST = "package.json";
+
+/** Compiled code of this package, copied together with the manifest. */
+const DIST_DIR = "dist";
+
+/** Entry point of the CLI, relative to the package root. */
+const CLI_ENTRY = join(DIST_DIR, "cli.js");
+
+/** Mode of the CLI entry point: executable by everyone. */
+const EXECUTABLE_MODE = 0o755;
+
+/** Root of the running package: the folder above `dist/` (or `src/` in tests). */
+const RUNNING_PACKAGE_ROOT = fileURLToPath(new URL("..", import.meta.url));
+
 /** Everything `setupRepo` needs from the outside, so tests can inject fakes. */
 export interface SetupContext {
   /** Tools directory. */
@@ -55,6 +72,8 @@ export interface SetupContext {
   env?: NodeJS.ProcessEnv;
   /** Docker operations; the real ones when omitted. */
   docker?: DockerOps;
+  /** Root of the package copied by the self install; the running package when omitted. */
+  packageRoot?: string;
 }
 
 /** Resolved dependencies shared by the setup lanes. */
@@ -171,7 +190,7 @@ async function setupSteps(commands: string[], deps: Deps): Promise<StepResult[]>
 }
 
 /**
- * Points `<toolsDir>/bin/claude-cloud` at a target, replacing any old link atomically.
+ * Points a link at a target, replacing any old link atomically.
  *
  * @param link - Link path.
  * @param target - Link target.
@@ -186,27 +205,66 @@ function replaceLink(link: string, target: string): void {
 }
 
 /**
- * Installs this package version into the tools dir (unless already there) and links its binary.
+ * Reads the version from a package manifest; never throws.
+ *
+ * @param root - Package root.
+ * @returns The version, or undefined when the manifest is missing or invalid.
+ */
+function manifestVersion(root: string): string | undefined {
+  try {
+    const version: unknown = (JSON.parse(readFileSync(join(root, MANIFEST), "utf8")) as { version?: unknown }).version;
+    return typeof version === "string" ? version : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Copies the package manifest and `dist/` into a target folder, through a temp folder renamed
+ * into place, and leaves the CLI entry point executable.
+ *
+ * @param source - Root of the running package.
+ * @param target - Destination package root.
+ * @param version - Version expected in the source manifest.
+ * @throws When the source is another version or the copy fails.
+ */
+function copyPackage(source: string, target: string, version: string): void {
+  const found = manifestVersion(source);
+  if (found !== version) throw new Error(`the package at ${source} is ${found ?? "unknown"}, not ${version}`);
+  const temp = `${target}.${process.pid}.tmp`;
+  rmSync(temp, { recursive: true, force: true });
+  mkdirSync(temp, { recursive: true });
+  cpSync(join(source, MANIFEST), join(temp, MANIFEST));
+  cpSync(join(source, DIST_DIR), join(temp, DIST_DIR), { recursive: true });
+  chmodSync(join(temp, CLI_ENTRY), EXECUTABLE_MODE);
+  rmSync(target, { recursive: true, force: true });
+  renameSync(temp, target);
+}
+
+/**
+ * Copies the running package into `<toolsDir>/pkg/<version>` (unless that version is already
+ * there) and links its binary, without npm or network, so it works before anything else runs.
  *
  * @param version - Version of this package.
- * @param deps - Shared dependencies; `env` carries the tools PATH so the pinned npm is used.
+ * @param toolsDir - Tools directory.
+ * @param source - Root of the running package.
  * @returns The self install result.
  */
-function selfInstall(version: string, deps: Deps): Promise<StepResult> {
+function selfInstall(version: string, toolsDir: string, source: string): Promise<StepResult> {
   return step(`self install ${version}`, async () => {
-    const bin = packageBin(deps.toolsDir, version);
-    if (!existsSync(bin)) {
-      const args = ["install", "--prefix", packageDir(deps.toolsDir, version), "--no-save", "--no-audit", "--no-fund"];
-      await deps.run("npm", [...args, `${PACKAGE}@${version}`], { env: deps.env });
-    }
-    replaceLink(linkPath(deps.toolsDir), bin);
+    const target = packageInstallDir(toolsDir, version);
+    if (manifestVersion(target) !== version) copyPackage(source, target, version);
+    const bin = packageBin(toolsDir, version);
+    replaceLink(bin, relative(dirname(bin), join(target, CLI_ENTRY)));
+    replaceLink(linkPath(toolsDir), bin);
   });
 }
 
 /**
- * Runs the three phases and writes the state; may throw, the caller turns that into a step.
- * The fingerprint reads versions and images again after the setup steps, because those steps
- * may generate the files they come from and `session` reads them later.
+ * Runs the phases and writes the state; may throw, the caller turns that into a step. Phase 1
+ * runs the tools, apt, Docker and the self install in parallel lanes; phase 2 runs the repo's
+ * setup steps. The fingerprint reads versions and images again after the setup steps, because
+ * those steps may generate the files they come from and `session` reads them later.
  *
  * @param repo - Repo root.
  * @param config - Valid repo config.
@@ -218,27 +276,35 @@ async function runPhases(repo: string, config: CloudConfig, ctx: SetupContext): 
   const versions = readToolVersions(repo);
   const images = configImages(config, repo);
   const base: Deps = { repo, toolsDir: ctx.toolsDir, run: ctx.run, env };
-  const toolsDeps: Deps = { ...base, env: toolsEnv(versions, ctx.toolsDir, env, findProxyCa(env, existsSync)) };
+  let resolved: Versions = {};
+  const toolsLane = async (): Promise<StepResult[]> => {
+    const resolution = await resolveVersions(versions, curlNodeIndex(ctx.run, env));
+    resolved = resolution.resolved;
+    return [...resolution.results, ...(await installTools(resolved, ctx.toolsDir, ctx.run, env))];
+  };
   const steps = await lanes(
-    () => installTools(versions, ctx.toolsDir, ctx.run, env),
+    toolsLane,
     () => aptLane(config, base),
     () => dockerLane(config, images, ctx.docker ?? realDocker, base),
+    async () => [await selfInstall(ctx.packageVersion, ctx.toolsDir, ctx.packageRoot ?? RUNNING_PACKAGE_ROOT)],
   );
+  const dirs = pathDirs(versions, ctx.toolsDir, resolved);
+  const toolsDeps: Deps = { ...base, env: toolsEnv(dirs, env, findProxyCa(env, existsSync)) };
   steps.push(...(await setupSteps(config.setup, toolsDeps)));
-  steps.push(await selfInstall(ctx.packageVersion, toolsDeps));
   const state: MachineState = {
     fingerprint: fingerprint(config, readToolVersions(repo), configImages(config, repo), ctx.packageVersion),
     packageVersion: ctx.packageVersion,
     finishedAt: new Date().toISOString(),
     steps,
+    resolved,
   };
   const saved = await step("write state", async () => writeState(ctx.toolsDir, repo, state));
   return saved.ok ? state : { ...state, steps: [...steps, saved] };
 }
 
 /**
- * Prepares the machine for one repo: tools, apt and Docker in parallel lanes (apt work in series
- * inside its lane), then the repo's setup steps, then the self install; writes the state.
+ * Prepares the machine for one repo: tools, apt, Docker and the self install in parallel lanes
+ * (apt work in series inside its lane), then the repo's setup steps; writes the state.
  *
  * @param repo - Repo root.
  * @param ctx - Dependencies (tools dir, runner, package version, optional env and Docker).
@@ -253,6 +319,7 @@ export async function setupRepo(repo: string, ctx: SetupContext): Promise<Machin
     packageVersion: ctx.packageVersion,
     finishedAt: new Date().toISOString(),
     steps: [{ name, ok: false, ms: 0, error }],
+    resolved: {},
   });
   const { config, errors } = readConfig(repo);
   if (!config) return failed("config", errors.join("; ") || "no config");

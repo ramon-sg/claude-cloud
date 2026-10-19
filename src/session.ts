@@ -9,10 +9,12 @@ import { readConfig } from "./config.ts";
 import type { CloudConfig } from "./config.ts";
 import { CONFIG_FILE, OUTPUT_PREFIX, PACKAGE, SETUP_SLOW_MS } from "./constants.ts";
 import { configImages, defaultBranch, readToolVersions } from "./detect.ts";
-import type { Tool } from "./detect.ts";
 import { realDocker } from "./docker.ts";
 import type { DockerOps } from "./docker.ts";
 import { pathLine, toolBinDirs } from "./installers.ts";
+import type { Versions } from "./installers.ts";
+import { linkDir } from "./launcher.ts";
+import { RunTimeoutError } from "./run.ts";
 import type { Run } from "./run.ts";
 import { fingerprint, readState } from "./state.ts";
 import type { MachineState } from "./state.ts";
@@ -39,6 +41,9 @@ const SHALLOW_MARKER = join(".git", "shallow");
 /** Environment that keeps git from ever prompting. */
 const GIT_NON_INTERACTIVE = { GIT_TERMINAL_PROMPT: "0" };
 
+/** Time limit of each repo session step, in milliseconds. */
+export const SESSION_STEP_TIMEOUT_MS = 120_000;
+
 /** Everything `session` needs from the outside, so tests can inject fakes. */
 export interface SessionContext {
   /** Process environment. */
@@ -54,23 +59,31 @@ export interface SessionContext {
 }
 
 /**
- * Builds the environment for repo commands: the pinned tools' bin dirs first on PATH, plus the CA.
+ * Lists the directories to put first on PATH: the pinned tools' bin dirs, then the folder of the
+ * `claude-cloud` link, so `claude-cloud doctor` resolves in the session.
  *
- * @param versions - Pinned versions by tool.
+ * @param versions - Requested versions by tool.
  * @param toolsDir - Tools directory.
+ * @param resolved - Versions setup installed (`MachineState.resolved`).
+ * @returns The directories, tools first.
+ * @example
+ * pathDirs({ node: "22" }, "/opt/claude-cloud", { node: "22.12.0" }); // ["/opt/claude-cloud/node-22.12.0/bin", "/opt/claude-cloud/bin"]
+ */
+export function pathDirs(versions: Versions, toolsDir: string, resolved: Versions): string[] {
+  return [...toolBinDirs(versions, toolsDir, resolved), linkDir(toolsDir)];
+}
+
+/**
+ * Builds the environment for repo commands: some directories first on PATH, plus the CA.
+ *
+ * @param dirs - Directories to put first on PATH (`pathDirs`).
  * @param baseEnv - Environment to extend; it is not modified.
  * @param ca - Proxy CA path, when found.
  * @returns A new environment.
  * @example
- * toolsEnv({ node: "24.14.1" }, "/opt/claude-cloud", process.env, "/root/.ccr/ca-bundle.crt");
+ * toolsEnv(["/opt/claude-cloud/node-24.14.1/bin"], process.env, "/root/.ccr/ca-bundle.crt");
  */
-export function toolsEnv(
-  versions: Partial<Record<Tool, string>>,
-  toolsDir: string,
-  baseEnv: NodeJS.ProcessEnv,
-  ca?: string,
-): NodeJS.ProcessEnv {
-  const dirs = toolBinDirs(versions, toolsDir);
+export function toolsEnv(dirs: string[], baseEnv: NodeJS.ProcessEnv, ca?: string): NodeJS.ProcessEnv {
   const path = [...dirs, ...(baseEnv.PATH ? [baseEnv.PATH] : [])].join(":");
   const env: NodeJS.ProcessEnv = { ...baseEnv, PATH: path };
   if (ca) env[PROXY_CA_VAR] = ca;
@@ -151,16 +164,22 @@ function readNotes(repo: string, notes: string | undefined): string | undefined 
 }
 
 /**
- * Appends the PATH line and the CA export to `$CLAUDE_ENV_FILE`, when it is set.
+ * Appends the PATH line and the CA export to `$CLAUDE_ENV_FILE`, when it is set; never throws.
  *
  * @param env - Process environment.
  * @param lines - Lines to write; empty ones are dropped.
+ * @returns An error line when the file could not be written; undefined otherwise.
  */
-function writeEnvFile(env: NodeJS.ProcessEnv, lines: string[]): void {
+function writeEnvFile(env: NodeJS.ProcessEnv, lines: string[]): string | undefined {
   const file = env[ENV_FILE_VAR];
   const body = lines.filter(Boolean);
-  if (!file || !body.length) return;
-  appendFileSync(file, `${body.join("\n")}\n`);
+  if (!file || !body.length) return undefined;
+  try {
+    appendFileSync(file, `${body.join("\n")}\n`);
+    return undefined;
+  } catch (err) {
+    return `could not write ${ENV_FILE_VAR} (${file}): ${err instanceof Error ? err.message : String(err)}`;
+  }
 }
 
 /**
@@ -172,7 +191,7 @@ function writeEnvFile(env: NodeJS.ProcessEnv, lines: string[]): void {
  * @param env - Environment for git.
  */
 async function syncGit(repo: string, run: Run, env: NodeJS.ProcessEnv): Promise<void> {
-  const opts = { cwd: repo, env: { ...env, ...GIT_NON_INTERACTIVE } };
+  const opts = { cwd: repo, env: { ...env, ...GIT_NON_INTERACTIVE }, stdio: "stderr" as const };
   if (existsSync(join(repo, SHALLOW_MARKER))) {
     await run("git", ["fetch", "-q", "--unshallow", "origin"], opts).catch(() => undefined);
   }
@@ -187,23 +206,25 @@ async function syncGit(repo: string, run: Run, env: NodeJS.ProcessEnv): Promise<
 
 /**
  * Runs the repo's session commands in order; a failure is reported and does not stop the rest.
+ * Their output goes to stderr, so it never lands in Claude's context, and each one is killed
+ * after `SESSION_STEP_TIMEOUT_MS`.
  *
  * @param repo - Repo root.
  * @param commands - Shell commands from the config (repo-owned by design).
  * @param run - Process runner.
  * @param env - Environment for the commands.
- * @returns The failed commands.
+ * @returns One line per failed or timed out command.
  */
 async function runSessionSteps(repo: string, commands: string[], run: Run, env: NodeJS.ProcessEnv): Promise<string[]> {
-  const failed: string[] = [];
+  const problems: string[] = [];
   for (const command of commands) {
     try {
-      await run("bash", ["-c", command], { cwd: repo, env });
-    } catch {
-      failed.push(command);
+      await run("bash", ["-c", command], { cwd: repo, env, stdio: "stderr", timeoutMs: SESSION_STEP_TIMEOUT_MS });
+    } catch (err) {
+      problems.push(`${err instanceof RunTimeoutError ? "session step timed out" : "session step failed"}: ${command}`);
     }
   }
-  return failed;
+  return problems;
 }
 
 /**
@@ -233,19 +254,21 @@ async function sessionBody(repo: string, ctx: SessionContext, out: string[]): Pr
   const { config, errors } = readConfig(repo);
   out.push(...errors);
   const versions = readToolVersions(repo);
+  const state = readState(ctx.toolsDir, repo);
+  const dirs = pathDirs(versions, ctx.toolsDir, state?.resolved ?? {});
   const ca = findProxyCa(ctx.env, existsSync);
-  writeEnvFile(ctx.env, [pathLine(versions, ctx.toolsDir), ca ? `export ${PROXY_CA_VAR}=${shellQuote(ca)}` : ""]);
-  if (config) out.push(...machineWarnings(repo, config, readState(ctx.toolsDir, repo)));
+  const envFileProblem = writeEnvFile(ctx.env, [pathLine(dirs), ca ? `export ${PROXY_CA_VAR}=${shellQuote(ca)}` : ""]);
+  if (envFileProblem) out.push(envFileProblem);
+  if (config) out.push(...machineWarnings(repo, config, state));
   const missing = (config?.requiredEnv ?? []).filter((name) => !ctx.env[name]);
   if (missing.length) out.push(`missing environment variables: ${missing.join(", ")}`);
   const notes = readNotes(repo, config?.notes);
   if (notes) out.push(notes);
   const dockerProblem = startDocker(ctx.docker ?? realDocker);
   if (dockerProblem) out.push(`could not start dockerd: ${dockerProblem}`);
-  const env = toolsEnv(versions, ctx.toolsDir, ctx.env, ca);
+  const env = toolsEnv(dirs, ctx.env, ca);
   await syncGit(repo, ctx.run, env);
-  const failed = await runSessionSteps(repo, config?.session ?? [], ctx.run, env);
-  out.push(...failed.map((command) => `session step failed: ${command}`));
+  out.push(...(await runSessionSteps(repo, config?.session ?? [], ctx.run, env)));
 }
 
 /**

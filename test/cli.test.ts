@@ -9,6 +9,7 @@ import { afterEach, beforeEach, test } from "node:test";
 import { main } from "../src/cli.ts";
 import type { CliDeps } from "../src/cli.ts";
 import type { Run } from "../src/run.ts";
+import { fakePackage } from "./fake-package.ts";
 
 let root: string;
 let home: string;
@@ -41,6 +42,7 @@ const deps = (up = true): CliDeps => ({
   packageVersion: "1.0.0",
   print: (line) => printed.push(line),
   cwd: root,
+  packageRoot: fakePackage(root, "1.0.0"),
 });
 
 /**
@@ -167,8 +169,8 @@ test("init writes the config and hook, doctor exits 1 when a check fails", async
   mkdirSync(join(repo, ".git"), { recursive: true });
   const base = { ...deps(), env: { CLAUDE_CLOUD_DIR: tools, CLAUDE_CLOUD_HOME: home, CLAUDE_PROJECT_DIR: repo } };
   assert.equal(await main(["init"], base), 0);
-  assert.equal(await main(["doctor"], { ...base, fetch: (async () => new Response(null, { status: 403 })) as typeof fetch, dockerInfo: () => true }), 1);
-  assert.equal(await main(["doctor"], { ...base, fetch: (async () => new Response(null, { status: 200 })) as typeof fetch, dockerInfo: () => true }), 1);
+  assert.equal(await main(["doctor"], { ...base, capture: async () => "403", dockerInfo: () => true }), 1);
+  assert.equal(await main(["doctor"], { ...base, capture: async () => "200", dockerInfo: () => true }), 1);
   assert.ok(printed.some((l) => l.includes("state: missing")));
   assert.ok(printed.some((l) => l.includes("registry.npmjs.org: ok")));
 });
