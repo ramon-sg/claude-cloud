@@ -14,6 +14,18 @@ const POLL_MS = 1000;
 /** Milliseconds in a second. */
 const MS_PER_SECOND = 1000;
 
+/** Message returned when there is no `dockerd` executable on PATH. */
+export const DOCKERD_MISSING = "dockerd not installed";
+
+/**
+ * Probe that tells whether a command exits with code 0.
+ *
+ * @param cmd - Executable.
+ * @param args - Arguments.
+ * @returns True on exit code 0.
+ */
+export type Probe = (cmd: string, args: string[]) => boolean;
+
 /** Operations on Docker that `session` and `setup` can have replaced in tests. */
 export interface DockerOps {
   /** Starts the daemon in the background if it is not running; never throws. Returns an error message on failure. */
@@ -51,16 +63,18 @@ export function dockerResponds(): boolean {
 
 /**
  * Starts `dockerd` detached, logging to `DOCKERD_LOG`. Does nothing when Docker already
- * answers, when there is no `dockerd`, or when one is already running. Never throws.
+ * answers or when one is already running. Never throws.
  *
- * @returns An error message when the daemon could not be started; undefined otherwise.
+ * @param probe - Command probe; the real one when omitted (tests inject a fake).
+ * @returns `DOCKERD_MISSING` when there is no `dockerd` on PATH, another error message when the
+ *   daemon could not be started, undefined otherwise.
  * @example
  * const problem = startDockerDetached();
  */
-export function startDockerDetached(): string | undefined {
-  if (dockerResponds()) return undefined;
-  if (!succeeds("sh", ["-c", "command -v dockerd"])) return undefined;
-  if (succeeds("pgrep", ["-x", "dockerd"])) return undefined;
+export function startDockerDetached(probe: Probe = succeeds): string | undefined {
+  if (probe("docker", ["info"])) return undefined;
+  if (!probe("sh", ["-c", "command -v dockerd"])) return DOCKERD_MISSING;
+  if (probe("pgrep", ["-x", "dockerd"])) return undefined;
   try {
     const log = openSync(DOCKERD_LOG, "a");
     try {
@@ -77,21 +91,23 @@ export function startDockerDetached(): string | undefined {
 }
 
 /**
- * Starts the daemon and waits for it to answer, up to `DOCKER_WAIT_SECONDS`.
+ * Starts the daemon and waits for it to answer, up to `DOCKER_WAIT_SECONDS`. Returns false at
+ * once when the daemon cannot be started at all (for example, no `dockerd` installed).
  *
+ * @param probe - Command probe; the real one when omitted (tests inject a fake).
  * @returns True when Docker answers in time; false when it never does or cannot start.
  * @example
  * if (await ensureDocker()) console.log("docker is up");
  */
-export async function ensureDocker(): Promise<boolean> {
-  if (startDockerDetached()) return false;
+export async function ensureDocker(probe: Probe = succeeds): Promise<boolean> {
+  if (startDockerDetached(probe)) return false;
   const deadline = Date.now() + DOCKER_WAIT_SECONDS * MS_PER_SECOND;
   while (Date.now() < deadline) {
-    if (dockerResponds()) return true;
+    if (probe("docker", ["info"])) return true;
     await new Promise((resolve) => setTimeout(resolve, POLL_MS));
   }
-  return dockerResponds();
+  return probe("docker", ["info"]);
 }
 
 /** The real Docker operations. */
-export const realDocker: DockerOps = { start: startDockerDetached, ensure: ensureDocker };
+export const realDocker: DockerOps = { start: () => startDockerDetached(), ensure: () => ensureDocker() };
