@@ -33,3 +33,29 @@ export async function step(name: string, fn: () => Promise<void>): Promise<StepR
     return { name, ok: false, ms: Date.now() - start, error };
   }
 }
+
+/** Prefix of the name given to a lane whose function rejected. */
+const LANE_NAME_PREFIX = "lane ";
+
+/**
+ * Runs lanes of steps concurrently and joins their results in lane order.
+ *
+ * @param laneFns - Lane functions, each resolving to the results of its own steps.
+ * @returns Results ordered by lane, then by position within the lane; never rejects.
+ * @example
+ * await lanes(async () => [await step("a", fa)], async () => [await step("b", fb)]);
+ */
+export async function lanes(...laneFns: Array<() => Promise<StepResult[]>>): Promise<StepResult[]> {
+  const groups = await Promise.all(
+    laneFns.map(async (laneFn, index): Promise<StepResult[]> => {
+      const start = Date.now();
+      try {
+        return await laneFn();
+      } catch (err) {
+        const error = err instanceof Error ? err.message : String(err);
+        return [{ name: `${LANE_NAME_PREFIX}${index}`, ok: false, ms: Date.now() - start, error }];
+      }
+    }),
+  );
+  return groups.flat();
+}
