@@ -16,8 +16,8 @@ const MS_PER_SECOND = 1000;
 
 /** Operations on Docker that `session` and `setup` can have replaced in tests. */
 export interface DockerOps {
-  /** Starts the daemon in the background if it is not running. */
-  start(): void;
+  /** Starts the daemon in the background if it is not running; never throws. Returns an error message on failure. */
+  start(): string | undefined;
   /** Starts the daemon and waits until it answers; resolves false on timeout. */
   ensure(): Promise<boolean>;
 }
@@ -49,22 +49,28 @@ function dockerResponds(): boolean {
 
 /**
  * Starts `dockerd` detached, logging to `DOCKERD_LOG`. Does nothing when Docker already
- * answers, when there is no `dockerd`, or when one is already running.
+ * answers, when there is no `dockerd`, or when one is already running. Never throws.
  *
+ * @returns An error message when the daemon could not be started; undefined otherwise.
  * @example
- * startDockerDetached();
+ * const problem = startDockerDetached();
  */
-export function startDockerDetached(): void {
-  if (dockerResponds()) return;
-  if (!succeeds("sh", ["-c", "command -v dockerd"])) return;
-  if (succeeds("pgrep", ["-x", "dockerd"])) return;
-  const log = openSync(DOCKERD_LOG, "a");
+export function startDockerDetached(): string | undefined {
+  if (dockerResponds()) return undefined;
+  if (!succeeds("sh", ["-c", "command -v dockerd"])) return undefined;
+  if (succeeds("pgrep", ["-x", "dockerd"])) return undefined;
   try {
-    const child = spawn("dockerd", [], { detached: true, stdio: ["ignore", log, log] });
-    child.on("error", () => {});
-    child.unref();
-  } finally {
-    closeSync(log);
+    const log = openSync(DOCKERD_LOG, "a");
+    try {
+      const child = spawn("dockerd", [], { detached: true, stdio: ["ignore", log, log] });
+      child.on("error", () => {});
+      child.unref();
+    } finally {
+      closeSync(log);
+    }
+    return undefined;
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
   }
 }
 
@@ -76,11 +82,7 @@ export function startDockerDetached(): void {
  * if (await ensureDocker()) console.log("docker is up");
  */
 export async function ensureDocker(): Promise<boolean> {
-  try {
-    startDockerDetached();
-  } catch {
-    return false;
-  }
+  if (startDockerDetached()) return false;
   const deadline = Date.now() + DOCKER_WAIT_SECONDS * MS_PER_SECOND;
   while (Date.now() < deadline) {
     if (dockerResponds()) return true;

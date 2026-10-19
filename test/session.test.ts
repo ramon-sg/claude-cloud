@@ -2,7 +2,8 @@
  * @file Tests for the session phase.
  */
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
@@ -41,7 +42,7 @@ const ctx = (env: NodeJS.ProcessEnv = {}) => ({
   toolsDir: tools,
   run,
   packageVersion: "1.0.0",
-  docker: { start: () => void dockerStarts++, ensure: async () => true },
+  docker: { start: () => { dockerStarts++; return undefined; }, ensure: async () => true },
 });
 
 const writeConfig = (extra: Record<string, unknown> = {}) =>
@@ -118,9 +119,14 @@ test("notes inside the repo are printed; escaping paths are skipped", async () =
   }
 });
 
-test("without CLAUDE_ENV_FILE nothing is written and nothing throws", async () => {
-  writeConfig();
-  await assert.doesNotReject(session(repo, ctx()));
+test("without CLAUDE_ENV_FILE nothing is written, warnings print and steps still run", async () => {
+  writeConfig({ session: ["echo hi"] });
+  writeFileSync(join(repo, ".nvmrc"), "24.14.1\n");
+  const lines = await session(repo, ctx());
+  assert.ok(lines.some((l) => l.includes("did not run")));
+  assert.ok(!lines.some((l) => l.includes("session error")));
+  assert.ok(calls.some((c) => c.cmd === "bash" && c.args[1] === "echo hi"));
+  assert.deepEqual(readdirSync(root).sort(), ["repo", "tools"].filter((n) => existsSync(join(root, n))));
 });
 
 test("with CLAUDE_ENV_FILE writes the PATH line and the quoted CA", async () => {
@@ -166,11 +172,44 @@ test("unshallow runs only when the clone is shallow", async () => {
   assert.ok(calls.some((c) => c.args.includes("--unshallow")));
 });
 
-test("an unexpected error becomes a line and session never rejects", async () => {
+test("a failing docker start is reported and git sync and session steps still run", async () => {
+  writeConfig({ session: ["echo hi"] });
+  for (const start of [() => { throw new Error("kaboom"); }, () => "kaboom"]) {
+    calls = [];
+    const lines = await session(repo, { ...ctx(), docker: { start, ensure: async () => true } });
+    assert.ok(lines.includes("claude-cloud: could not start dockerd: kaboom"));
+    assert.ok(calls.some((c) => c.args.includes("main:refs/remotes/origin/main")));
+    assert.ok(calls.some((c) => c.cmd === "bash" && c.args[1] === "echo hi"));
+  }
+});
+
+test("a branch rejected by check-ref-format is never fetched", async () => {
   writeConfig();
-  const bad = { ...ctx(), docker: { start: () => { throw new Error("kaboom"); }, ensure: async () => true } };
-  const lines = await session(repo, bad);
-  assert.ok(lines.some((l) => l.includes("kaboom")));
+  const rejecting: Run = async (cmd, args, opts) => {
+    await run(cmd, args, opts);
+    if (args.includes("check-ref-format")) throw new Error("bad ref");
+  };
+  await session(repo, { ...ctx(), run: rejecting });
+  assert.ok(calls.some((c) => c.args.includes("check-ref-format")));
+  assert.ok(!calls.some((c) => c.args.some((a) => a.includes(":refs/remotes/origin/"))));
+});
+
+test("a branch starting with a dash is never fetched", async () => {
+  writeConfig();
+  execFileSync("git", ["init", "-q"], { cwd: repo });
+  execFileSync("git", ["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/-evil"], { cwd: repo });
+  await session(repo, ctx());
+  assert.ok(!calls.some((c) => c.args.some((a) => a.includes(":refs/remotes/origin/"))));
+});
+
+test("notes: symlinks escaping the repo are skipped and dot-prefixed names are allowed", async () => {
+  writeFileSync(join(root, "outside.md"), "leak");
+  symlinkSync(join(root, "outside.md"), join(repo, "link.md"));
+  writeConfig({ notes: "link.md" });
+  assert.ok(!(await session(repo, ctx())).join("\n").includes("leak"));
+  writeFileSync(join(repo, "..notes.md"), "dotted");
+  writeConfig({ notes: "..notes.md" });
+  assert.ok((await session(repo, ctx())).includes("claude-cloud: dotted"));
 });
 
 test("toolsEnv prepends the pinned bin dirs and adds the CA", () => {

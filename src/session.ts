@@ -2,12 +2,12 @@
  * @file The `session` phase: runs from the SessionStart hook of a cloud session, reports the
  * state of the machine, wires the pinned tools into the session and runs the repo's session steps.
  */
-import { appendFileSync, existsSync, readFileSync } from "node:fs";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { appendFileSync, existsSync, readFileSync, realpathSync } from "node:fs";
+import { basename, isAbsolute, join, relative, sep } from "node:path";
 import { findProxyCa, shellQuote } from "./ca.ts";
-import { CONFIG_FILE, readConfig } from "./config.ts";
+import { readConfig } from "./config.ts";
 import type { CloudConfig } from "./config.ts";
-import { OUTPUT_PREFIX, PACKAGE, SETUP_SLOW_MS } from "./constants.ts";
+import { CONFIG_FILE, OUTPUT_PREFIX, PACKAGE, SETUP_SLOW_MS } from "./constants.ts";
 import { defaultBranch, detectImages, readToolVersions } from "./detect.ts";
 import type { Tool } from "./detect.ts";
 import { realDocker } from "./docker.ts";
@@ -114,7 +114,7 @@ function expectedFingerprint(repo: string, config: CloudConfig, state: MachineSt
 function machineWarnings(repo: string, config: CloudConfig, state: MachineState | undefined): string[] {
   if (!state) {
     return [
-      `the environment setup did not run for ${repo.split(sep).filter(Boolean).pop()}. Set the setup script of the environment in claude.ai to: npx -y ${PACKAGE}@1 setup`,
+      `the environment setup did not run for ${basename(repo)}. Set the setup script of the environment in claude.ai to: npx -y ${PACKAGE}@1 setup`,
     ];
   }
   const out: string[] = [];
@@ -139,10 +139,11 @@ function machineWarnings(repo: string, config: CloudConfig, state: MachineState 
  */
 function readNotes(repo: string, notes: string | undefined): string | undefined {
   if (!notes || isAbsolute(notes)) return undefined;
-  const target = resolve(repo, notes);
-  const rel = relative(resolve(repo), target);
-  if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) return undefined;
   try {
+    const root = realpathSync(repo);
+    const target = realpathSync(join(root, notes));
+    const rel = relative(root, target);
+    if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return undefined;
     return readFileSync(target, "utf8").trim() || undefined;
   } catch {
     return undefined;
@@ -206,6 +207,20 @@ async function runSessionSteps(repo: string, commands: string[], run: Run, env: 
 }
 
 /**
+ * Starts Docker without ever throwing, even when the injected operation does.
+ *
+ * @param docker - Docker operations.
+ * @returns An error message, or undefined on success.
+ */
+function startDocker(docker: DockerOps): string | undefined {
+  try {
+    return docker.start();
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
+  }
+}
+
+/**
  * Does the work of `session`; may throw, the caller turns that into a line.
  *
  * @param repo - Repo root.
@@ -225,7 +240,8 @@ async function sessionBody(repo: string, ctx: SessionContext, out: string[]): Pr
   if (missing.length) out.push(`missing environment variables: ${missing.join(", ")}`);
   const notes = readNotes(repo, config?.notes);
   if (notes) out.push(notes);
-  (ctx.docker ?? realDocker).start();
+  const dockerProblem = startDocker(ctx.docker ?? realDocker);
+  if (dockerProblem) out.push(`could not start dockerd: ${dockerProblem}`);
   const env = toolsEnv(versions, ctx.toolsDir, ctx.env, ca);
   await syncGit(repo, ctx.run, env);
   const failed = await runSessionSteps(repo, config?.session ?? [], ctx.run, env);

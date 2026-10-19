@@ -3,9 +3,8 @@
  */
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { CONFIG_FILE } from "./constants.ts";
 
-/** Path of the config file, relative to the repo root. */
-export const CONFIG_FILE = ".claude/cloud.json";
 
 /** Top-level key that editors use to point at the JSON schema; allowed but not part of the config. */
 const SCHEMA_KEY = "$schema";

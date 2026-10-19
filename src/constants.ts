@@ -5,6 +5,9 @@
 /** Prefix of every line the CLI prints. */
 export const OUTPUT_PREFIX = "claude-cloud: ";
 
+/** Path of the repo config file, relative to the repo root. */
+export const CONFIG_FILE = ".claude/cloud.json";
+
 /** Name of this package on npm. */
 export const PACKAGE = "@ramon-sg/claude-cloud";
 
