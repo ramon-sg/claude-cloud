@@ -39,6 +39,15 @@ const NPM_PACKAGES: Readonly<Record<"bun" | "deno" | "pnpm", string>> = {
   pnpm: "pnpm",
 };
 
+/** Strict shape of an accepted version: no leading `-` or `/`, no shell metacharacters. */
+const VERSION_PATTERN = /^\d+(\.\d+){0,2}([-+][0-9A-Za-z.]+)?$/;
+
+/** Script that downloads (`$1`) and extracts into a directory (`$2`); fails if curl fails. */
+const NODE_INSTALL_SCRIPT = 'set -o pipefail; curl -fsSL -- "$1" | tar -xJ -C "$2" --strip-components=1';
+
+/** Placeholder for `$0` in the node install script. */
+const SCRIPT_NAME = "_";
+
 /** Describes how one tool is installed and where its executables end up. */
 export interface Installer {
   /**
@@ -86,6 +95,30 @@ export function nodeArch(arch: string): string {
 }
 
 /**
+ * Checks that a version is safe to use in paths and command arguments.
+ *
+ * @param tool - Tool name, for the error message.
+ * @param version - Version taken from an untrusted file.
+ * @returns Nothing when valid.
+ * @throws When the version does not match the strict pattern.
+ * @example
+ * assertVersion("node", "24.14.1"); // ok
+ */
+export function assertVersion(tool: string, version: string): void {
+  if (!VERSION_PATTERN.test(version)) throw new Error(`invalid version for ${tool}: ${version}`);
+}
+
+/**
+ * Tells whether a version is safe to use.
+ *
+ * @param version - Version taken from an untrusted file.
+ * @returns True when it matches the strict pattern.
+ */
+function isValidVersion(version: string): boolean {
+  return VERSION_PATTERN.test(version);
+}
+
+/**
  * Builds the default directory layout for a tool.
  *
  * @param tool - Tool name.
@@ -93,7 +126,10 @@ export function nodeArch(arch: string): string {
  * @returns The `dir` and `binDir` functions.
  */
 function layout(tool: Tool, binSubdir: string): Pick<Installer, "dir" | "binDir"> {
-  const dir = (toolsDir: string, version: string): string => join(toolsDir, `${tool}-${version}`);
+  const dir = (toolsDir: string, version: string): string => {
+    assertVersion(tool, version);
+    return join(toolsDir, `${tool}-${version}`);
+  };
   return { dir, binDir: (toolsDir, version) => join(dir(toolsDir, version), binSubdir) };
 }
 
@@ -128,7 +164,7 @@ export const INSTALLERS: Record<Tool, Installer> = {
       const target = nodeLayout.dir(toolsDir, version);
       const url = `${NODE_DIST_URL}/v${version}/node-v${version}-linux-${nodeArch(process.arch)}.tar.xz`;
       mkdirSync(target, { recursive: true });
-      return run("bash", ["-c", `curl -fsSL ${url} | tar -xJ -C ${target} --strip-components=1`], { env });
+      return run("bash", ["-c", NODE_INSTALL_SCRIPT, SCRIPT_NAME, url, target], { env });
     },
   },
   bun: npmInstaller("bun", () => NPM_PACKAGES.bun),
@@ -175,6 +211,10 @@ export async function installTools(
   for (const tool of TOOLS) {
     const version = versions[tool];
     if (!version) continue;
+    if (!isValidVersion(version)) {
+      results.push(await step(`${tool} ${version}`, async () => assertVersion(tool, version)));
+      continue;
+    }
     const installer = INSTALLERS[tool];
     const binDir = installer.binDir(toolsDir, version);
     if (!existsSync(join(binDir, EXECUTABLES[tool]))) {
@@ -190,14 +230,14 @@ export async function installTools(
  *
  * @param versions - Pinned versions by tool.
  * @param toolsDir - Root directory holding all tools.
- * @returns An `export PATH=...` line with a literal `$PATH`, or an empty string when nothing is pinned.
+ * @returns An `export PATH=...` line with a literal `$PATH`, or an empty string when nothing valid is pinned; invalid versions are skipped.
  * @example
  * pathLine({ node: "24.14.1" }, "/opt/claude-cloud"); // export PATH="/opt/claude-cloud/node-24.14.1/bin:$PATH"
  */
 export function pathLine(versions: Versions, toolsDir: string): string {
   const dirs = TOOLS.flatMap((tool) => {
     const version = versions[tool];
-    return version ? [INSTALLERS[tool].binDir(toolsDir, version)] : [];
+    return version && isValidVersion(version) ? [INSTALLERS[tool].binDir(toolsDir, version)] : [];
   });
   return dirs.length ? `export PATH="${dirs.join(":")}:$PATH"` : "";
 }

