@@ -36,11 +36,19 @@ VERSION="$(cd "$ROOT" && node -p "require('./package.json').version")"
 [ -f "$TMP/$TARBALL" ] || fail "npm pack did not produce $TARBALL"
 
 echo "== start the proxy and the box"
-"${COMPOSE[@]}" up -d --build >/dev/null 2>&1
+"${COMPOSE[@]}" up -d --build >"$TMP/compose.log" 2>&1 || { cat "$TMP/compose.log" >&2; fail "docker compose up failed"; }
+ready=""
 for _ in $(seq 1 30); do
-  in_box 'curl -sI -o /dev/null https://registry.npmjs.org/' && break
+  if in_box 'curl -sI -o /dev/null https://registry.npmjs.org/' 2>/dev/null; then ready=1; break; fi
   sleep 1
 done
+[ -n "$ready" ] || fail "the proxy did not let the box reach registry.npmjs.org within 30 seconds"
+
+echo "== the box has no route out except the proxy"
+if in_box 'curl -sS --noproxy "*" --max-time 5 -o /dev/null https://registry.npmjs.org/' 2>/dev/null; then
+  fail "the box reached registry.npmjs.org without the proxy"
+fi
+echo "ok: direct egress from the box fails"
 
 echo "== the proxy blocks GitHub and lets npm through"
 if in_box 'curl -sf -o /dev/null https://github.com'; then fail "github.com was reachable through the proxy"; fi
@@ -54,9 +62,8 @@ echo "== install the tarball and run setup"
 "${COMPOSE[@]}" cp "$HERE/fixture" box:/work/fixture >/dev/null 2>&1
 in_box 'git config --global --add safe.directory "*" && cd /work/fixture && git init -q && git config user.email t@example.com && git config user.name t && git add -A && git commit -qm fixture'
 in_box 'npm install -g /tmp/package.tgz >/dev/null 2>&1'
-# WHY: the self install step fetches this package version from npm, and 1.0.0 is not published
-# when the release is tested. Pinning the fixture to the packed version and pre-installing the
-# tarball under pkg/<version> makes that step see the package already there, without the registry.
+# NOTE: the fixture pins the packed version, so setup runs this build instead of relaunching
+# another one from npm.
 in_box "node -e \"
 const fs = require('fs');
 const f = '/work/fixture/.claude/cloud.json';
@@ -64,7 +71,6 @@ const c = JSON.parse(fs.readFileSync(f, 'utf8'));
 c.version = '$VERSION';
 fs.writeFileSync(f, JSON.stringify(c, null, 2));
 \""
-in_box "npm install --prefix /opt/claude-cloud/pkg/$VERSION --no-save --no-audit --no-fund /tmp/package.tgz >/dev/null 2>&1"
 in_box 'CLAUDE_CLOUD_HOME=/work claude-cloud setup' || fail "claude-cloud setup exited non-zero"
 
 echo "== assertions"
@@ -81,10 +87,24 @@ if (failed.length) { console.log(JSON.stringify(failed)); process.exit(1); }
 console.log('0 failed of');
 \""
 expect_output "self install link" "/opt/claude-cloud/pkg/$VERSION/node_modules/.bin/claude-cloud" 'readlink /opt/claude-cloud/bin/claude-cloud'
+expect_output "self install copy" "$VERSION" "node -p \"require('/opt/claude-cloud/pkg/$VERSION/node_modules/@ramon-sg/claude-cloud/package.json').version\""
+expect_output "installed binary" "$VERSION" '/opt/claude-cloud/bin/claude-cloud --version'
 
-echo "== session writes the PATH line"
-in_box 'rm -f /tmp/env; CLAUDE_PROJECT_DIR=/work/fixture CLAUDE_CODE_REMOTE=true CLAUDE_ENV_FILE=/tmp/env claude-cloud session >/tmp/session.out 2>&1' || fail "claude-cloud session failed"
-in_box 'grep -q "^export PATH=.*node-24.14.1/bin" /tmp/env' || fail "no PATH line in the env file: $(in_box 'cat /tmp/env /tmp/session.out 2>&1')"
+echo "== session, through the installed copy, writes the PATH line"
+in_box 'rm -f /tmp/env; npm uninstall -g @ramon-sg/claude-cloud >/dev/null 2>&1; ! command -v claude-cloud' || fail "the global install is still on PATH"
+in_box 'cd /work/fixture && CLAUDE_PROJECT_DIR=/work/fixture CLAUDE_CODE_REMOTE=true CLAUDE_ENV_FILE=/tmp/env /opt/claude-cloud/bin/claude-cloud session >/tmp/session.out 2>/tmp/session.err' || fail "claude-cloud session failed"
+in_box 'grep -q "^export PATH=\"/opt/claude-cloud/node-24.14.1/bin:/opt/claude-cloud/bun-1.4.2/node_modules/.bin:/opt/claude-cloud/bin:\$PATH\"" /tmp/env' \
+  || fail "wrong PATH line in the env file: $(in_box 'cat /tmp/env /tmp/session.out 2>&1')"
 echo "ok: session wrote the PATH line"
+expect_output "claude-cloud on the session PATH" "/opt/claude-cloud/bin/claude-cloud" '. /tmp/env && command -v claude-cloud'
+
+echo "== doctor checks the network through the proxy"
+in_box '. /tmp/env && cd /work/fixture && claude-cloud doctor >/tmp/doctor.out 2>&1' || true
+doctor="$(in_box 'cat /tmp/doctor.out')"
+echo "$doctor"
+grep -qx "claude-cloud: network registry.npmjs.org: ok" <<<"$doctor" || fail "doctor did not reach registry.npmjs.org"
+grep -qx "claude-cloud: network api.github.com: blocked" <<<"$doctor" || fail "doctor did not report api.github.com as blocked"
+grep -qx "claude-cloud: tool node 24.14.1: ok" <<<"$doctor" || fail "doctor did not find node"
+echo "ok: doctor saw npm reachable and GitHub blocked"
 
 echo "PASS: container walkthrough"

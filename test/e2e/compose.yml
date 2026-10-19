@@ -1,12 +1,22 @@
 # Test bench: a proxy that blocks GitHub and a root container that can only reach the net through it.
+# `box` sits only on the internal network (no route out); `squid` is on both, so it is the only way out.
 name: claude-cloud-e2e
+networks:
+  internal:
+    internal: true
+  egress: {}
 services:
   squid:
-    image: ubuntu/squid:latest
+    image: ubuntu/squid:6.6-24.04_beta
     command: ["-NYC", "-f", "/etc/squid/squid.conf"]
     volumes:
       - ./squid.conf:/etc/squid/squid.conf:ro
+    networks:
+      - internal
+      - egress
   box:
     build: .
     depends_on:
       - squid
+    networks:
+      - internal
