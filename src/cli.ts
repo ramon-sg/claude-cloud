@@ -9,8 +9,10 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { readConfig } from "./config.ts";
 import { CONFIG_FILE, DOCKERD_LOG, OUTPUT_PREFIX, homeDir, toolsDir } from "./constants.ts";
-import { realDocker } from "./docker.ts";
+import { doctor } from "./doctor.ts";
+import { dockerResponds, realDocker } from "./docker.ts";
 import type { DockerOps } from "./docker.ts";
+import { init } from "./init.ts";
 import { findRepos, packageBin, planSetup, relaunch } from "./launcher.ts";
 import type { SetupPlanItem } from "./launcher.ts";
 import { runProcess } from "./run.ts";
@@ -27,6 +29,8 @@ Commands:
   setup [--repo <path>]  prepare the machine for every repo in the home dir (or only <path>)
   session                report the machine state and wire the tools into the session
   docker                 start the Docker daemon and wait until it answers
+  doctor                 check the network allowlist, tools, Docker and the machine state
+  init                   create .claude/cloud.json and register the SessionStart hook
 
 Options:
   --help                 show this help
@@ -66,6 +70,10 @@ export interface CliDeps {
   packageVersion: string;
   /** Prints one line on stdout. */
   print: (line: string) => void;
+  /** Fetch used by `doctor`; the global one when omitted. */
+  fetch?: typeof fetch;
+  /** Docker probe used by `doctor`; `docker info` when omitted. */
+  dockerInfo?: () => boolean;
   /** Working directory, used to find the repo when `CLAUDE_PROJECT_DIR` is not set. */
   cwd: string;
 }
@@ -231,6 +239,35 @@ async function dockerCommand(deps: CliDeps): Promise<number> {
 }
 
 /**
+ * Runs `doctor` for the session repo.
+ *
+ * @param deps - CLI dependencies.
+ * @returns 0 when every check passes, 1 otherwise.
+ */
+async function doctorCommand(deps: CliDeps): Promise<number> {
+  const result = await doctor(sessionRepo(deps), {
+    fetch: deps.fetch ?? fetch,
+    toolsDir: toolsDir(deps.env),
+    packageVersion: deps.packageVersion,
+    dockerInfo: deps.dockerInfo ?? dockerResponds,
+  });
+  for (const line of result.lines) deps.print(line);
+  return result.ok ? EXIT_OK : EXIT_FAIL;
+}
+
+/**
+ * Runs `init` for the session repo.
+ *
+ * @param deps - CLI dependencies.
+ * @returns 0, or 1 when settings.json is not valid JSON.
+ */
+function initCommand(deps: CliDeps): number {
+  const result = init(sessionRepo(deps), deps.packageVersion);
+  for (const line of result.lines) deps.print(line);
+  return result.ok ? EXIT_OK : EXIT_FAIL;
+}
+
+/**
  * Runs the CLI.
  *
  * @param argv - Arguments after the executable name.
@@ -244,6 +281,8 @@ export async function main(argv: string[], deps: CliDeps): Promise<number> {
   if (command === "setup") return setupCommand(rest, deps);
   if (command === "session") return sessionCommand(deps);
   if (command === "docker") return dockerCommand(deps);
+  if (command === "doctor") return doctorCommand(deps);
+  if (command === "init") return initCommand(deps);
   if (command === "--version") {
     deps.print(deps.packageVersion);
     return EXIT_OK;

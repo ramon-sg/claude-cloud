@@ -42,8 +42,10 @@ function succeeds(cmd: string, args: string[]): boolean {
  * Tells whether the daemon already answers.
  *
  * @returns True when `docker info` succeeds.
+ * @example
+ * if (!dockerResponds()) console.log("docker is down");
  */
-function dockerResponds(): boolean {
+export function dockerResponds(): boolean {
   return succeeds("docker", ["info"]);
 }
 

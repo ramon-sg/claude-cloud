@@ -161,3 +161,20 @@ test("a repo that throws does not stop the next ones", async () => {
   assert.ok(printed.includes(`claude-cloud: setup error for ${first}: boom`));
   assert.deepEqual(calls.at(-1), { cmd: "npx", args: ["-y", "@ramon-sg/claude-cloud@1.2.0", "setup", "--repo", second] });
 });
+
+test("init writes the config and hook, doctor exits 1 when a check fails", async () => {
+  const repo = join(home, "fresh");
+  mkdirSync(join(repo, ".git"), { recursive: true });
+  const base = { ...deps(), env: { CLAUDE_CLOUD_DIR: tools, CLAUDE_CLOUD_HOME: home, CLAUDE_PROJECT_DIR: repo } };
+  assert.equal(await main(["init"], base), 0);
+  assert.equal(await main(["doctor"], { ...base, fetch: (async () => new Response(null, { status: 403 })) as typeof fetch, dockerInfo: () => true }), 1);
+  assert.equal(await main(["doctor"], { ...base, fetch: (async () => new Response(null, { status: 200 })) as typeof fetch, dockerInfo: () => true }), 1);
+  assert.ok(printed.some((l) => l.includes("state: missing")));
+  assert.ok(printed.some((l) => l.includes("registry.npmjs.org: ok")));
+});
+
+test("help lists doctor and init", async () => {
+  await main(["--help"], deps());
+  assert.ok(printed.join("\n").includes("doctor"));
+  assert.ok(printed.join("\n").includes("init"));
+});

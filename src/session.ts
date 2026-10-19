@@ -96,8 +96,10 @@ function minutesSeconds(ms: number): string {
  * @param config - Repo config.
  * @param state - Recorded state.
  * @returns The expected fingerprint.
+ * @example
+ * expectedFingerprint("/home/user/app", config, state) === state.fingerprint;
  */
-function expectedFingerprint(repo: string, config: CloudConfig, state: MachineState): string {
+export function expectedFingerprint(repo: string, config: CloudConfig, state: MachineState): string {
   return fingerprint(config, readToolVersions(repo), configImages(config, repo), state.packageVersion);
 }
 
