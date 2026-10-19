@@ -3,7 +3,7 @@
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -83,4 +83,22 @@ test("defaultBranch follows origin/HEAD", () => {
 
 test("defaultBranch falls back to main", () => {
   assert.equal(defaultBranch(makeRepo({})), "main");
+});
+
+test("detectImages ignores composer.yml and reads list-style image", () => {
+  const repo = makeRepo({
+    "composer.yml": "image: nope:1\n",
+    "compose.prod.yaml": "services:\n  - image: redis:7\n",
+  });
+  assert.deepEqual(detectImages(repo), ["redis:7"]);
+});
+
+test("detectImages survives an unreadable directory", { skip: process.getuid?.() === 0 }, () => {
+  const repo = makeRepo({ "compose.yml": "services:\n  a:\n    image: postgres:16\n", "locked/x": "" });
+  chmodSync(join(repo, "locked"), 0o000);
+  try {
+    assert.deepEqual(detectImages(repo), ["postgres:16"]);
+  } finally {
+    chmodSync(join(repo, "locked"), 0o755);
+  }
 });

@@ -2,6 +2,7 @@
  * @file Deduces tool versions, Docker images and the default branch from a repo's files.
  */
 import { execFileSync } from "node:child_process";
+import type { Dirent } from "node:fs";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -27,13 +28,19 @@ const SKIPPED_DIRS: readonly string[] = ["node_modules", ".git"];
 const TOOL_ALIASES: Readonly<Record<string, Tool>> = { nodejs: "node" };
 
 /** Matches `docker-compose*.yml|yaml` and `compose*.yml|yaml`. */
-const COMPOSE_FILE = /^(docker-)?compose.*\.ya?ml$/;
+const COMPOSE_FILE = /^(docker-)?compose([.-][^/]*)?\.ya?ml$/;
 
 /** Matches an `image:` line in a compose file. */
-const IMAGE_LINE = /^\s*image:\s*(\S+)/;
+const IMAGE_LINE = /^\s*(?:-\s+)?image:\s*(\S+)/;
 
 /** Matches a pinned `FROM` line in a Dockerfile. */
 const FROM_LINE = /^FROM\s+(?:--\S+\s+)*(\S+@sha256:\S+)/i;
+
+/** Milliseconds after which a git call is abandoned, so session start never stalls. */
+const GIT_TIMEOUT_MS = 10_000;
+
+/** Environment that keeps git non-interactive and its output in English. */
+const GIT_ENV = { GIT_TERMINAL_PROMPT: "0", LC_ALL: "C" };
 
 /** Matches the `HEAD branch:` line of `git remote show`. */
 const HEAD_BRANCH_LINE = /^\s*HEAD branch:\s*(\S+)/m;
@@ -157,7 +164,13 @@ export function readToolVersions(repo: string): Versions {
  */
 function composeImages(repo: string): string[] {
   const images: string[] = [];
-  for (const entry of readdirSync(repo)) {
+  let entries: string[] = [];
+  try {
+    entries = readdirSync(repo);
+  } catch {
+    return images;
+  }
+  for (const entry of entries) {
     if (!COMPOSE_FILE.test(entry)) continue;
     for (const line of (readText(join(repo, entry)) ?? "").split("\n")) {
       const match = IMAGE_LINE.exec(line);
@@ -176,7 +189,13 @@ function composeImages(repo: string): string[] {
  */
 function dockerfileImages(dir: string, depth: number): string[] {
   const images: string[] = [];
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+  let entries: Dirent[] = [];
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return images;
+  }
+  for (const entry of entries) {
     if (entry.isDirectory()) {
       const deeper = depth < DOCKERFILE_MAX_DEPTH && !SKIPPED_DIRS.includes(entry.name);
       if (deeper) images.push(...dockerfileImages(join(dir, entry.name), depth + 1));
@@ -216,7 +235,13 @@ export function detectImages(repo: string): string[] {
  */
 function gitOutput(repo: string, args: string[]): string | undefined {
   try {
-    return execFileSync("git", args, { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    return execFileSync("git", args, {
+      cwd: repo,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: GIT_TIMEOUT_MS,
+      env: { ...process.env, ...GIT_ENV },
+    }).trim();
   } catch {
     return undefined;
   }
