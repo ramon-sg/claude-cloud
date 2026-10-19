@@ -1,0 +1,32 @@
+{
+  "name": "@ramon-sg/claude-cloud",
+  "version": "1.0.0",
+  "description": "Zero-dependency CLI that prepares Claude Code cloud sessions.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "claude-cloud": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "schema.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "test": "node --test 'test/**/*.test.ts'"
+  },
+  "devDependencies": {
+    "@types/node": "20.19.43",
+    "typescript": "7.0.2"
+  }
+}

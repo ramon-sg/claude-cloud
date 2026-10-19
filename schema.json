@@ -1,0 +1,63 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "claude-cloud config",
+  "description": "Contents of .claude/cloud.json for @ramon-sg/claude-cloud.",
+  "type": "object",
+  "required": ["version"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string", "description": "Path or URL of this schema." },
+    "version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$",
+      "description": "Exact @ramon-sg/claude-cloud version to run (no ranges)."
+    },
+    "aptRepos": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": [],
+      "description": "APT source lines to add before installing packages."
+    },
+    "apt": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": [],
+      "description": "APT packages to install."
+    },
+    "docker": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": { "pull": "auto" },
+      "properties": {
+        "pull": {
+          "description": "\"auto\" detects images, false disables pulling, or list images explicitly.",
+          "oneOf": [
+            { "const": "auto" },
+            { "const": false },
+            { "type": "array", "items": { "type": "string" } }
+          ],
+          "default": "auto"
+        }
+      }
+    },
+    "setup": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": [],
+      "description": "Shell commands run once when the environment is set up."
+    },
+    "session": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": [],
+      "description": "Shell commands run at the start of every session."
+    },
+    "requiredEnv": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": [],
+      "description": "Environment variables that must be set; a warning is shown when missing."
+    },
+    "notes": { "type": "string", "description": "Free-form notes shown to the user." }
+  }
+}
