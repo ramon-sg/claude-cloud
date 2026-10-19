@@ -3,9 +3,7 @@
  * @file Command line entry point of claude-cloud (stub: later tasks add the commands).
  */
 import { readFileSync } from "node:fs";
-
-/** Prefix of every line the CLI prints. */
-const OUTPUT_PREFIX = "claude-cloud: ";
+import { OUTPUT_PREFIX } from "./constants.ts";
 
 /** Help text shown by `--help`. */
 const HELP = `${OUTPUT_PREFIX}prepares Claude Code cloud sessions.

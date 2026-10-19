@@ -226,6 +226,22 @@ export async function installTools(
 }
 
 /**
+ * Lists the bin directories of the pinned tools, in `TOOLS` order; invalid versions are skipped.
+ *
+ * @param versions - Pinned versions by tool.
+ * @param toolsDir - Root directory holding all tools.
+ * @returns The bin directories to put on PATH.
+ * @example
+ * toolBinDirs({ node: "24.14.1" }, "/opt/claude-cloud"); // ["/opt/claude-cloud/node-24.14.1/bin"]
+ */
+export function toolBinDirs(versions: Versions, toolsDir: string): string[] {
+  return TOOLS.flatMap((tool) => {
+    const version = versions[tool];
+    return version && isValidVersion(version) ? [INSTALLERS[tool].binDir(toolsDir, version)] : [];
+  });
+}
+
+/**
  * Builds the shell line that puts the pinned tools on PATH.
  *
  * @param versions - Pinned versions by tool.
@@ -235,9 +251,6 @@ export async function installTools(
  * pathLine({ node: "24.14.1" }, "/opt/claude-cloud"); // export PATH="/opt/claude-cloud/node-24.14.1/bin:$PATH"
  */
 export function pathLine(versions: Versions, toolsDir: string): string {
-  const dirs = TOOLS.flatMap((tool) => {
-    const version = versions[tool];
-    return version && isValidVersion(version) ? [INSTALLERS[tool].binDir(toolsDir, version)] : [];
-  });
+  const dirs = toolBinDirs(versions, toolsDir);
   return dirs.length ? `export PATH="${dirs.join(":")}:$PATH"` : "";
 }
