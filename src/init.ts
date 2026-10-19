@@ -22,18 +22,37 @@ const JSON_INDENT = 2;
 const HOOK_COMMAND =
   "[ \"$CLAUDE_CODE_REMOTE\" = true ] || exit 0; /opt/claude-cloud/bin/claude-cloud session || echo 'claude-cloud: the environment setup did not run; see npx @ramon-sg/claude-cloud doctor'";
 
+/** The hook `init` registers. */
+const HOOK = { type: "command", command: HOOK_COMMAND, timeout: HOOK_TIMEOUT_SECONDS };
+
 /** Result of `init`. */
 export interface InitResult {
   /** Prefixed lines describing what was done. */
   lines: string[];
-  /** False when settings.json could not be updated because it is not valid JSON. */
+  /** False when settings.json could not be updated because of its contents. */
   ok: boolean;
 }
 
-/** Loose shape of the settings file, enough to find the SessionStart hooks. */
-interface Settings {
-  [key: string]: unknown;
-  hooks?: { [event: string]: unknown; SessionStart?: unknown };
+/**
+ * Tells whether a value is a plain JSON object.
+ *
+ * @param value - Any parsed JSON value.
+ * @returns True for non-null, non-array objects.
+ */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Builds the outcome for a settings file that cannot be updated safely: it is left untouched and
+ * the user gets the hook to add by hand.
+ *
+ * @param reason - What is wrong with the file.
+ * @returns The failed outcome.
+ */
+function addByHand(reason: string): { line: string; ok: boolean } {
+  const entry = JSON.stringify({ hooks: [HOOK] });
+  return { line: `${SETTINGS_FILE} ${reason}, left untouched; add this entry to hooks.SessionStart by hand: ${entry}`, ok: false };
 }
 
 /**
@@ -91,19 +110,21 @@ function scaffoldConfig(repo: string, packageVersion: string): string {
  */
 function registerHook(repo: string): { line: string; ok: boolean } {
   const file = join(repo, SETTINGS_FILE);
-  let settings: Settings = {};
+  let settings: unknown = {};
   if (existsSync(file)) {
     try {
-      settings = JSON.parse(readFileSync(file, "utf8")) as Settings;
+      settings = JSON.parse(readFileSync(file, "utf8"));
     } catch {
-      return { line: `${SETTINGS_FILE} is not valid JSON, left untouched; add the SessionStart hook by hand`, ok: false };
+      return addByHand("is not valid JSON");
     }
   }
+  if (!isRecord(settings)) return addByHand("is not a JSON object");
   const hooks = settings.hooks ?? {};
-  const entries = Array.isArray(hooks.SessionStart) ? hooks.SessionStart : [];
+  if (!isRecord(hooks)) return addByHand('has a "hooks" that is not an object');
+  const entries = hooks.SessionStart ?? [];
+  if (!Array.isArray(entries)) return addByHand('has a "hooks.SessionStart" that is not an array');
   if (hasHook(entries)) return { line: `${SETTINGS_FILE} already has the SessionStart hook`, ok: true };
-  const hook = { type: "command", command: HOOK_COMMAND, timeout: HOOK_TIMEOUT_SECONDS };
-  writeJson(file, { ...settings, hooks: { ...hooks, SessionStart: [...entries, { hooks: [hook] }] } });
+  writeJson(file, { ...settings, hooks: { ...hooks, SessionStart: [...entries, { hooks: [HOOK] }] } });
   return { line: `added the SessionStart hook to ${SETTINGS_FILE}`, ok: true };
 }
 

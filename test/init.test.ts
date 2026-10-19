@@ -64,3 +64,16 @@ test("leaves an invalid settings.json untouched and reports it", () => {
   assert.equal(readFileSync(join(repo, ".claude/settings.json"), "utf8"), "{ nope");
   assert.ok(existsSync(join(repo, ".claude/cloud.json")));
 });
+
+test("settings.json values that are not the expected shape are left untouched", () => {
+  for (const text of ["null", '"x"', '{"hooks":"x"}', '{"hooks":{"SessionStart":{}}}']) {
+    mkdirSync(join(repo, ".claude"), { recursive: true });
+    writeFileSync(join(repo, ".claude/settings.json"), text);
+    const result = init(repo, "1.0.0");
+    assert.equal(result.ok, false, text);
+    assert.equal(readFileSync(join(repo, ".claude/settings.json"), "utf8"), text);
+    const line = result.lines.at(-1) ?? "";
+    assert.ok(line.includes("by hand"), line);
+    assert.ok(line.includes("claude-cloud session") && line.includes('"timeout":600'), line);
+  }
+});
