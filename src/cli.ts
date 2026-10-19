@@ -5,6 +5,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { readConfig } from "./config.ts";
 import { CONFIG_FILE, DOCKERD_LOG, OUTPUT_PREFIX, homeDir, toolsDir } from "./constants.ts";
@@ -34,6 +35,15 @@ Options:
 
 /** Environment variable with the project dir that Claude Code passes to hooks. */
 const PROJECT_DIR_VAR = "CLAUDE_PROJECT_DIR";
+
+/** Environment marker set on a delegated `session`, so it never delegates again. */
+export const DELEGATED_ENV = "CLAUDE_CLOUD_DELEGATED";
+
+/** Value of `DELEGATED_ENV` that marks a delegated run. */
+const DELEGATED_VALUE = "1";
+
+/** Option that limits setup to one repo. */
+const REPO_OPTION = "--repo";
 
 /** Timeout of the git call that finds the repo root, in milliseconds. */
 const GIT_TIMEOUT_MS = 10_000;
@@ -107,7 +117,7 @@ async function runOne(repo: string, deps: CliDeps): Promise<void> {
 }
 
 /**
- * Carries out one item of the setup plan; never throws.
+ * Carries out one item of the setup plan; may throw, the caller reports it and moves on.
  *
  * @param item - Plan item.
  * @param deps - CLI dependencies.
@@ -139,15 +149,22 @@ async function runPlanItem(item: SetupPlanItem, deps: CliDeps): Promise<void> {
  */
 async function setupCommand(args: string[], deps: CliDeps): Promise<number> {
   try {
-    const at = args.indexOf("--repo");
-    const repo = at >= 0 ? args[at + 1] : undefined;
-    if (repo) {
-      await runOne(repo, deps);
+    const at = args.indexOf(REPO_OPTION);
+    if (at >= 0) {
+      const value = args[at + 1];
+      if (!value || value.startsWith("-")) deps.print(`${OUTPUT_PREFIX}${REPO_OPTION} needs a path`);
+      else await runOne(resolve(deps.cwd, value), deps);
       return EXIT_OK;
     }
     const repos = findRepos(homeDir(deps.env));
     if (!repos.length) deps.print(`${OUTPUT_PREFIX}no repos found in ${homeDir(deps.env)}`);
-    for (const item of planSetup(repos, deps.packageVersion, readConfig)) await runPlanItem(item, deps);
+    for (const item of planSetup(repos, deps.packageVersion, readConfig)) {
+      try {
+        await runPlanItem(item, deps);
+      } catch (err) {
+        deps.print(`${OUTPUT_PREFIX}setup error for ${item.repo}: ${message(err)}`);
+      }
+    }
   } catch (err) {
     deps.print(`${OUTPUT_PREFIX}setup error: ${message(err)}`);
   }
@@ -177,7 +194,8 @@ function sessionRepo(deps: CliDeps): string {
 
 /**
  * Runs `session`, delegating to the installed version the repo pins when it differs from this
- * one. Always exits 0 so the session start is never blocked.
+ * one. A delegated run carries `DELEGATED_ENV` and never delegates again, so two versions can
+ * not bounce between each other. Always exits 0 so the session start is never blocked.
  *
  * @param deps - CLI dependencies.
  * @returns Exit code 0.
@@ -186,9 +204,10 @@ async function sessionCommand(deps: CliDeps): Promise<number> {
   const repo = sessionRepo(deps);
   const tools = toolsDir(deps.env);
   const wanted = readConfig(repo).config?.version;
-  if (wanted && wanted !== deps.packageVersion && existsSync(packageBin(tools, wanted))) {
+  const delegated = deps.env[DELEGATED_ENV] === DELEGATED_VALUE;
+  if (!delegated && wanted && wanted !== deps.packageVersion && existsSync(packageBin(tools, wanted))) {
     try {
-      await deps.run(packageBin(tools, wanted), ["session"], { env: deps.env });
+      await deps.run(packageBin(tools, wanted), ["session"], { env: { ...deps.env, [DELEGATED_ENV]: DELEGATED_VALUE } });
     } catch (err) {
       deps.print(`${OUTPUT_PREFIX}session ${wanted} failed: ${message(err)}`);
     }

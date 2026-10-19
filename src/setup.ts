@@ -83,7 +83,8 @@ function refused(name: string, message: string): Promise<StepResult> {
  *
  * @param config - Repo config.
  * @param deps - Shared dependencies.
- * @returns One result per apt repo, plus update and install when there is apt work.
+ * @returns One result per apt repo and refused package, plus update (when there is a repo or a
+ *   valid package) and install (when there is a valid package).
  */
 async function aptLane(config: CloudConfig, deps: Deps): Promise<StepResult[]> {
   if (!config.aptRepos.length && !config.apt.length) return [];
@@ -101,6 +102,7 @@ async function aptLane(config: CloudConfig, deps: Deps): Promise<StepResult[]> {
   for (const pkg of config.apt.filter((p) => !valid.includes(p))) {
     results.push(await refused(`apt package ${pkg}`, "invalid Debian package name"));
   }
+  if (!valid.length && !config.aptRepos.length) return results;
   results.push(await step("apt-get update", () => deps.run("apt-get", ["update", "-q"], { env })));
   if (valid.length) {
     results.push(await step("apt-get install", () => deps.run("apt-get", ["install", "-y", "-q", "--", ...valid], { env })));
@@ -130,21 +132,22 @@ async function pullAll(images: string[], deps: Deps): Promise<StepResult[]> {
 }
 
 /**
- * Starts Docker and pulls the images; does nothing when there are no images to pull.
+ * Starts Docker and pulls the images. Docker is started even with no images, because setup
+ * steps may use it (`docker build`); only `docker.pull: false` leaves it alone.
  *
+ * @param config - Repo config.
  * @param images - Image references from the config or detection (untrusted).
  * @param docker - Docker operations.
  * @param deps - Shared dependencies.
  * @returns A failed `docker` step when the daemon does not answer, otherwise one result per image.
  */
-async function dockerLane(images: string[], docker: DockerOps, deps: Deps): Promise<StepResult[]> {
-  if (!images.length) return [];
+async function dockerLane(config: CloudConfig, images: string[], docker: DockerOps, deps: Deps): Promise<StepResult[]> {
+  if (config.docker.pull === false) return [];
   const results: StepResult[] = [];
   const valid = images.filter((image) => !WHITESPACE.test(image) && !image.startsWith("-") && image !== "");
   for (const image of images.filter((i) => !valid.includes(i))) {
     results.push(await refused(`docker pull ${image}`, "invalid image reference"));
   }
-  if (!valid.length) return results;
   const up = await docker.ensure().catch(() => false);
   if (!up) return [...results, await refused("docker", `dockerd did not start; see ${DOCKERD_LOG}`)];
   return [...results, ...(await pullAll(valid, deps))];
@@ -202,6 +205,8 @@ function selfInstall(version: string, deps: Deps): Promise<StepResult> {
 
 /**
  * Runs the three phases and writes the state; may throw, the caller turns that into a step.
+ * The fingerprint reads versions and images again after the setup steps, because those steps
+ * may generate the files they come from and `session` reads them later.
  *
  * @param repo - Repo root.
  * @param config - Valid repo config.
@@ -217,12 +222,12 @@ async function runPhases(repo: string, config: CloudConfig, ctx: SetupContext): 
   const steps = await lanes(
     () => installTools(versions, ctx.toolsDir, ctx.run, env),
     () => aptLane(config, base),
-    () => dockerLane(images, ctx.docker ?? realDocker, base),
+    () => dockerLane(config, images, ctx.docker ?? realDocker, base),
   );
   steps.push(...(await setupSteps(config.setup, toolsDeps)));
   steps.push(await selfInstall(ctx.packageVersion, toolsDeps));
   const state: MachineState = {
-    fingerprint: fingerprint(config, versions, images, ctx.packageVersion),
+    fingerprint: fingerprint(config, readToolVersions(repo), configImages(config, repo), ctx.packageVersion),
     packageVersion: ctx.packageVersion,
     finishedAt: new Date().toISOString(),
     steps,
