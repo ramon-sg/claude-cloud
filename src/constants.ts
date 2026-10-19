@@ -17,6 +17,15 @@ export const TOOLS_DIR = "/opt/claude-cloud";
 /** Environment variable that overrides `TOOLS_DIR` (used by tests). */
 export const TOOLS_DIR_ENV = "CLAUDE_CLOUD_DIR";
 
+/** Default directory whose first-level folders are the cloned repos. */
+export const HOME_DIR = "/home/user";
+
+/** Environment variable that overrides `HOME_DIR` (used by tests). */
+export const HOME_DIR_ENV = "CLAUDE_CLOUD_HOME";
+
+/** Number of Docker images pulled at the same time. */
+export const PULL_JOBS = 4;
+
 /** Log file of the detached Docker daemon. */
 export const DOCKERD_LOG = "/var/log/claude-cloud-dockerd.log";
 
@@ -39,4 +48,16 @@ export const PROXY_CA_DEFAULT = "/root/.ccr/ca-bundle.crt";
  */
 export function toolsDir(env: NodeJS.ProcessEnv): string {
   return env[TOOLS_DIR_ENV] || TOOLS_DIR;
+}
+
+/**
+ * Resolves the directory that holds the cloned repos, honoring the `CLAUDE_CLOUD_HOME` override.
+ *
+ * @param env - Process environment.
+ * @returns The override when set and non-empty, otherwise `HOME_DIR`.
+ * @example
+ * homeDir({ CLAUDE_CLOUD_HOME: "/tmp/home" }); // "/tmp/home"
+ */
+export function homeDir(env: NodeJS.ProcessEnv): string {
+  return env[HOME_DIR_ENV] || HOME_DIR;
 }

@@ -5,6 +5,7 @@ import { execFileSync } from "node:child_process";
 import type { Dirent } from "node:fs";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import type { CloudConfig } from "./config.ts";
 
 /** Tools whose versions can be pinned. */
 export const TOOLS = ["node", "bun", "deno", "pnpm", "yarn", "uv"] as const;
@@ -224,6 +225,21 @@ export function detectImages(repo: string): string[] {
   } catch {
     return [];
   }
+}
+
+/**
+ * Chooses the images a config asks to pull; setup and session share it so their fingerprints agree.
+ *
+ * @param config - Repo config.
+ * @param repo - Path of the repo root.
+ * @returns `detectImages(repo)` for `"auto"`, the explicit list, or `[]` for `false`.
+ * @example
+ * configImages({ ...config, docker: { pull: ["postgres:16"] } }, "/home/user/repo"); // ["postgres:16"]
+ */
+export function configImages(config: CloudConfig, repo: string): string[] {
+  const pull = config.docker.pull;
+  if (pull === "auto") return detectImages(repo);
+  return pull === false ? [] : pull;
 }
 
 /**

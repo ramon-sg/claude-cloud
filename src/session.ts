@@ -8,7 +8,7 @@ import { findProxyCa, shellQuote } from "./ca.ts";
 import { readConfig } from "./config.ts";
 import type { CloudConfig } from "./config.ts";
 import { CONFIG_FILE, OUTPUT_PREFIX, PACKAGE, SETUP_SLOW_MS } from "./constants.ts";
-import { defaultBranch, detectImages, readToolVersions } from "./detect.ts";
+import { configImages, defaultBranch, readToolVersions } from "./detect.ts";
 import type { Tool } from "./detect.ts";
 import { realDocker } from "./docker.ts";
 import type { DockerOps } from "./docker.ts";
@@ -98,9 +98,7 @@ function minutesSeconds(ms: number): string {
  * @returns The expected fingerprint.
  */
 function expectedFingerprint(repo: string, config: CloudConfig, state: MachineState): string {
-  const pull = config.docker.pull;
-  const images = pull === "auto" ? detectImages(repo) : pull === false ? [] : pull;
-  return fingerprint(config, readToolVersions(repo), images, state.packageVersion);
+  return fingerprint(config, readToolVersions(repo), configImages(config, repo), state.packageVersion);
 }
 
 /**
